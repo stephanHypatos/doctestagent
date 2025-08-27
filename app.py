@@ -10,10 +10,9 @@ import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 
-# ======================================
+# =========================
 # Settings
-# ======================================
-
+# =========================
 BASE_URL = "https://www.medi-learn.de"
 START_PATH = "/pruefungsprotokolle/facharztpruefung/"
 START_URL = urllib.parse.urljoin(BASE_URL, START_PATH)
@@ -23,41 +22,30 @@ UA = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0.0.0 Safari/537.36"
 )
-
 HEADERS = {"User-Agent": UA}
 DETAIL_RE = re.compile(r"detailed\.php\?ID=(\d+)", re.I)
 
 
-# ======================================
-# Utilities
-# ======================================
-
+# =========================
+# Helpers
+# =========================
 def norm(s: str) -> str:
-    """Normalize whitespace and lowercase."""
     return re.sub(r"\s+", " ", (s or "").strip()).lower()
 
 
 def absolute_url(base: str, href: Optional[str]) -> Optional[str]:
-    """Build absolute URL from base + href."""
     if not href:
         return None
     return urllib.parse.urljoin(base, href)
 
 
 def get_soup(session: requests.Session, url: str) -> BeautifulSoup:
-    """GET a URL and parse with the built-in HTML parser (no lxml dependency)."""
-    resp = session.get(url, headers=HEADERS, timeout=30)
-    resp.raise_for_status()
-    return BeautifulSoup(resp.text, "html.parser")
-
-
-def get_forms(soup: BeautifulSoup) -> List[BeautifulSoup]:
-    """Return all <form> elements."""
-    return list(soup.find_all("form"))
+    r = session.get(url, headers=HEADERS, timeout=30)
+    r.raise_for_status()
+    return BeautifulSoup(r.text, "html.parser")
 
 
 def form_has_filters(form: BeautifulSoup) -> bool:
-    """Heuristic: does a form look like the Uni/Fach filter form?"""
     txt = form.get_text(" ", strip=True).lower()
     needles = [
         "uni",
@@ -75,67 +63,81 @@ def form_has_filters(form: BeautifulSoup) -> bool:
 
 
 def collect_hidden_inputs(form: BeautifulSoup) -> Dict[str, str]:
-    """Collect hidden input fields as a payload base (incl. CSRF tokens)."""
     data: Dict[str, str] = {}
     for el in form.select("input[type=hidden]"):
         name = el.get("name")
-        if not name:
-            continue
-        data[name] = el.get("value", "") or ""
+        if name:
+            data[name] = el.get("value", "") or ""
     return data
 
 
-def option_map_by_text(select: BeautifulSoup) -> Dict[str, Tuple[str, str]]:
-    """
-    Map normalized visible text -> (value, visible_text) for all <option>.
-    """
-    out: Dict[str, Tuple[str, str]] = {}
-    for opt in select.find_all("option"):
-        vis = (opt.get_text(strip=True) or "").strip()
-        if not vis:
-            continue
-        val = opt.get("value", vis) or vis
-        out[norm(vis)] = (val, vis)
-    return out
+def extract_forms(session: requests.Session, url: str) -> List[dict]:
+    """Return structured info for each <form> on the page."""
+    soup = get_soup(session, url)
+    forms = soup.find_all("form")
+    structured: List[dict] = []
+    for idx, frm in enumerate(forms):
+        action = frm.get("action") or url
+        action_url = absolute_url(url, action) or url
+        selects = []
+        for sel in frm.find_all("select"):
+            sel_name = sel.get("name") or ""
+            sel_id = sel.get("id") or ""
+            # nearby label-ish text
+            ctx = sel.find_parent().get_text(" ", strip=True) if sel.find_parent() else ""
+            options = []
+            for opt in sel.find_all("option"):
+                vis = (opt.get_text(strip=True) or "").strip()
+                if not vis:
+                    continue
+                val = opt.get("value", vis) or vis
+                options.append({"visible": vis, "value": val})
+            selects.append(
+                {
+                    "name": sel_name,
+                    "id": sel_id,
+                    "context": ctx,
+                    "options": options,
+                }
+            )
+        structured.append(
+            {
+                "index": idx,
+                "action_url": action_url,
+                "hidden": collect_hidden_inputs(frm),
+                "selects": selects,
+                "looks_like_filter": form_has_filters(frm),
+                "raw_html_len": len(str(frm)),
+            }
+        )
+    return structured
 
 
-def find_selects(form: BeautifulSoup) -> List[BeautifulSoup]:
-    """Return all <select> elements in a form."""
-    return list(form.find_all("select"))
-
-
-def guess_select_role(select: BeautifulSoup) -> Optional[str]:
-    """
-    Guess if a <select> is for 'uni' or 'fach' based on name/id/nearby text/options.
-    Returns 'uni', 'fach', or None if unsure.
-    """
+def guess_select_role(select: dict) -> Optional[str]:
     name = (select.get("name") or "").lower()
-    sel_id = (select.get("id") or "").lower()
-    around = select.find_parent().get_text(" ", strip=True).lower()
-
+    sid = (select.get("id") or "").lower()
+    around = (select.get("context") or "").lower()
     uni_tokens = ["uni", "universität", "standort", "ort", "tu dresden", "dresden"]
     fach_tokens = ["fach", "fachgebiet", "innere", "medizin", "chirurgie", "neurologie"]
 
-    if any(t in name or t in sel_id for t in ["uni", "standort", "ort"]):
+    if any(t in name or t in sid for t in ["uni", "standort", "ort"]):
         return "uni"
-    if any(t in name or t in sel_id for t in ["fach", "fachgebiet", "gebiet"]):
+    if any(t in name or t in sid for t in ["fach", "fachgebiet", "gebiet"]):
         return "fach"
-
     if any(t in around for t in uni_tokens):
         return "uni"
     if any(t in around for t in fach_tokens):
         return "fach"
 
-    # Option-content heuristic
-    opts = [norm(o.get_text(strip=True)) for o in select.find_all("option")]
+    opts_norm = [norm(o["visible"]) for o in select.get("options", [])]
     city_hits = sum(
         1
-        for o in opts
+        for o in opts_norm
         if any(c in o for c in ["berlin", "münchen", "hamburg", "dresden", "köln", "hannover", "frankfurt"])
     )
     fach_hits = sum(
         1
-        for o in opts
+        for o in opts_norm
         if any(f in o for f in ["innere", "chirurgie", "neurologie", "anästhesie", "derma", "gyn"])
     )
     if city_hits > fach_hits:
@@ -145,37 +147,33 @@ def guess_select_role(select: BeautifulSoup) -> Optional[str]:
     return None
 
 
-def pick_option_value(
-    select: BeautifulSoup, wanted_text: str
-) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Pick an option by visible text (case/space-insensitive).
-    Returns (value, visible_text) or (None, None).
-    """
-    omap = option_map_by_text(select)
-    key = norm(wanted_text)
-    if key in omap:
-        return omap[key]
-    for k, (v, vis) in omap.items():
+def pick_option_value(options: List[dict], wanted_visible: str) -> Tuple[Optional[str], Optional[str]]:
+    key = norm(wanted_visible)
+    # exact by normalized visible
+    for o in options:
+        if norm(o["visible"]) == key:
+            return o["value"], o["visible"]
+    # fuzzy contains/startswith
+    for o in options:
+        k = norm(o["visible"])
         if k.startswith(key) or key in k or k in key:
-            return v, vis
+            return o["value"], o["visible"]
     return None, None
 
 
-def extract_result_rows(soup: BeautifulSoup) -> List[Dict[str, str]]:
-    """Extract unique detailed.php?ID=… links as rows."""
+def extract_result_rows_from_html(html_text: str) -> List[Dict[str, str]]:
+    soup = BeautifulSoup(html_text, "html.parser")
     rows: List[Dict[str, str]] = []
     for a in soup.find_all("a", href=True):
-        match = DETAIL_RE.search(a["href"])
-        if not match:
+        m = DETAIL_RE.search(a["href"])
+        if not m:
             continue
-        ml_id = match.group(1)
+        ml_id = m.group(1)
         url = absolute_url(START_URL, a["href"])
         title = a.get_text(" ", strip=True) or f"Protokoll {ml_id}"
-        if not url:
-            continue
-        rows.append({"ml_id": ml_id, "title": title, "url": url})
-
+        if url:
+            rows.append({"ml_id": ml_id, "title": title, "url": url})
+    # de-dup
     seen: set[str] = set()
     uniq: List[Dict[str, str]] = []
     for r in rows:
@@ -186,17 +184,15 @@ def extract_result_rows(soup: BeautifulSoup) -> List[Dict[str, str]]:
     return uniq
 
 
-def find_next_page_url(soup: BeautifulSoup) -> Optional[str]:
-    """Try to find a 'next' pagination link."""
+def find_next_page_url_from_html(html_text: str) -> Optional[str]:
+    soup = BeautifulSoup(html_text, "html.parser")
     candidates: List[str] = []
     for a in soup.find_all("a", href=True):
         txt = a.get_text(" ", strip=True).lower()
         if any(t in txt for t in ["weiter", "nächste", "next", "»", "›", ">"]):
             candidates.append(a["href"])
-
     if not candidates:
         return None
-
     for href in candidates:
         full = absolute_url(START_URL, href)
         if full and "/pruefungsprotokolle/facharztpruefung" in full:
@@ -204,168 +200,42 @@ def find_next_page_url(soup: BeautifulSoup) -> Optional[str]:
     return absolute_url(START_URL, candidates[0])
 
 
-def submit_filter(
+def post_form(
     session: requests.Session,
-    start_soup: BeautifulSoup,
-    uni_text: str,
-    fach_text: str,
-) -> Tuple[List[Dict[str, str]], BeautifulSoup]:
-    """
-    Locate the filter form, choose Uni/Fach by visible text, POST it, and parse results.
-    Returns (first_rows, first_results_soup).
-    """
-    forms = get_forms(start_soup)
-    target_form: Optional[BeautifulSoup] = None
-    for frm in forms:
-        if form_has_filters(frm):
-            target_form = frm
-            break
-    if not target_form:
-        target_form = forms[0] if forms else None
-    if not target_form:
-        raise RuntimeError("No <form> found on start page.")
-
-    action = target_form.get("action") or START_URL
-    action_url = absolute_url(START_URL, action)
-    if not action_url:
-        raise RuntimeError("Form action URL could not be resolved.")
-
-    payload = collect_hidden_inputs(target_form)
-
-    selects = find_selects(target_form)
-    uni_name: Optional[str] = None
-    fach_name: Optional[str] = None
-    uni_val: Optional[str] = None
-    fach_val: Optional[str] = None
-
-    for sel in selects:
-        role = guess_select_role(sel)
-        if role == "uni":
-            v, _ = pick_option_value(sel, uni_text)
-            if v:
-                uni_val = v
-                uni_name = sel.get("name")
-        elif role == "fach":
-            v, _ = pick_option_value(sel, fach_text)
-            if v:
-                fach_val = v
-                fach_name = sel.get("name")
-
-    # Fallback: search any select for the desired texts
-    if not uni_val:
-        for sel in selects:
-            v, _ = pick_option_value(sel, uni_text)
-            if v:
-                uni_val = v
-                uni_name = sel.get("name")
-                break
-
-    if not fach_val:
-        for sel in selects:
-            v, _ = pick_option_value(sel, fach_text)
-            if v:
-                fach_val = v
-                fach_name = sel.get("name")
-                break
-
-    if not uni_name or not fach_name or not uni_val or not fach_val:
-        raise RuntimeError(
-            "Could not map both filters. "
-            f"Resolved -> uni: name={uni_name} val={uni_val}, "
-            f"fach: name={fach_name} val={fach_val}"
-        )
-
-    payload[uni_name] = uni_val
-    payload[fach_name] = fach_val
-
-    # Some forms require submit button name/value
-    submit = target_form.find("input", {"type": "submit"})
-    if submit and submit.get("name"):
-        payload[submit["name"]] = submit.get("value", "Suchen")
-
-    resp = session.post(action_url, data=payload, headers=HEADERS, timeout=30)
-    resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
-    rows = extract_result_rows(soup)
-    return rows, soup
+    action_url: str,
+    payload: Dict[str, str],
+) -> str:
+    r = session.post(action_url, data=payload, headers=HEADERS, timeout=30)
+    r.raise_for_status()
+    return r.text
 
 
-def crawl_all_pages(
-    session: requests.Session,
-    first_soup: BeautifulSoup,
-    pause_s: float = 0.5,
-) -> List[Dict[str, str]]:
-    """Follow pagination from the first result page and aggregate all rows."""
-    all_rows = extract_result_rows(first_soup)
+def crawl_all_pages_html(session: requests.Session, first_html: str, pause_s: float = 0.5) -> List[Dict[str, str]]:
+    all_rows = extract_result_rows_from_html(first_html)
     seen_ids = {r["ml_id"] for r in all_rows}
 
-    next_url = find_next_page_url(first_soup)
-    safety = 0
-    while next_url and safety < 30:
-        safety += 1
+    next_url = find_next_page_url_from_html(first_html)
+    guard = 0
+    while next_url and guard < 30:
+        guard += 1
         time.sleep(pause_s)
-        resp = session.get(next_url, headers=HEADERS, timeout=30)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-        rows = extract_result_rows(soup)
+        r = session.get(next_url, headers=HEADERS, timeout=30)
+        r.raise_for_status()
+        html_text = r.text
+        rows = extract_result_rows_from_html(html_text)
         for row in rows:
             if row["ml_id"] not in seen_ids:
                 seen_ids.add(row["ml_id"])
                 all_rows.append(row)
-        next_url = find_next_page_url(soup)
+        next_url = find_next_page_url_from_html(html_text)
 
     all_rows.sort(key=lambda x: int(x["ml_id"]))
     return all_rows
 
 
-def fetch_detail_fields(session: requests.Session, url: str) -> Dict[str, str]:
-    """
-    Optional enrichment: fetch each detail page and try to extract Uni/Fach/Atmosphäre/Prüfer.
-    """
-    try:
-        resp = session.get(url, headers=HEADERS, timeout=30)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-        text = soup.get_text(" ", strip=True)
-        low = text.lower()
-
-        def grab(label_variants: List[str]) -> str:
-            for lab in label_variants:
-                match = re.search(lab, low)
-                if match:
-                    start = match.end()
-                    snippet = text[start : start + 150]
-                    snippet = re.split(r"[\n\r|•\-]{2,}|  ", snippet)[0]
-                    return snippet.strip(":; \n\r\t")
-            return ""
-
-        uni_guess = grab([r"\buni\b", r"universit[aä]t", r"dresden"])
-        fach_guess = grab([r"\bfach\b", r"fachgebiet", r"innere", r"medizin"])
-        atmos = grab([r"atmosph[aä]re", r"stimmung"])
-        pruefer = grab([r"pr[üu]fer", r"vorsitz", r"kommission"])
-
-        title = soup.title.get_text(strip=True) if soup.title else url
-        return {
-            "title_detail": title,
-            "uni_guess": uni_guess,
-            "fach_guess": fach_guess,
-            "atmosphaere": atmos,
-            "pruefer": pruefer,
-        }
-    except Exception:
-        return {
-            "title_detail": "",
-            "uni_guess": "",
-            "fach_guess": "",
-            "atmosphaere": "",
-            "pruefer": "",
-        }
-
-
-# ======================================
-# Streamlit UI
-# ======================================
-
+# =========================
+# UI
+# =========================
 st.set_page_config(
     page_title="Medi-Learn Protokolle – Form Scraper",
     page_icon="🩺",
@@ -373,101 +243,235 @@ st.set_page_config(
 )
 st.title("🩺 Medi-Learn Facharzt-Prüfungsprotokolle — Form-Submission Scraper")
 st.caption(
-    "Posts the real Medi-Learn filter form (no search engines). "
-    "Handles pagination and counts matching Protokolle."
+    "Posts the real Medi-Learn filter form (handles pagination). "
+    "If auto-detection fails, use the manual mapping below."
 )
 
 with st.sidebar:
-    st.header("Filter")
-    uni = st.text_input(
-        "Universität (sichtbarer Text)",
+    st.header("Auto mode (tries to detect everything)")
+    uni_auto = st.text_input(
+        "Uni (sichtbarer Text – auto mode)",
         value="Dresden",
-        help="Z. B. „Dresden“, „TU Dresden“, „Uniklinikum Dresden“.",
+        help="Z. B. „Dresden“, „TU Dresden“, „Uniklinikum Dresden“",
     )
-    fach = st.text_input(
-        "Fach (sichtbarer Text)",
-        value="Innere Medizin",
-        help="Z. B. „Innere Medizin“.",
-    )
-    enrich = st.checkbox(
-        "Optional: Details aus jeder Protokoll-Seite lesen (langsamer)", value=False
+    fach_auto = st.text_input(
+        "Fach (sichtbarer Text – auto mode)", value="Innere Medizin"
     )
     pause = st.slider("Pausenzeit bei Pagination (Sek.)", 0.0, 2.0, 0.5, 0.1)
-    go = st.button("📤 Formular absenden & Zählen")
+    run_auto = st.button("🚀 Auto: Formular absenden & zählen")
 
-st.markdown(
-    "**Hinweis:** Das Tool erkennt die richtigen Formularfelder (Uni/Fach) automatisch, "
-    "wählt anhand des sichtbaren Textes und sendet die Anfrage ab."
-)
+    st.markdown("---")
+    st.header("Manual mapping (use if auto fails)")
+    run_discover = st.button("🔍 Discover forms & selects")
 
-if go:
-    try:
-        with st.spinner("Lade Startseite & analysiere Formular…"):
-            sess = requests.Session()
-            sess.headers.update(HEADERS)
-            start_soup = get_soup(sess, START_URL)
+sess = requests.Session()
+sess.headers.update(HEADERS)
 
-        with st.spinner("Sende Formular & lese erste Ergebnisse…"):
-            first_rows, first_soup = submit_filter(
-                sess, start_soup, uni_text=uni.strip(), fach_text=fach.strip()
+if run_discover:
+    with st.spinner("Lade Startseite & finde Formulare…"):
+        forms_info = extract_forms(sess, START_URL)
+    st.session_state["forms_info"] = forms_info
+
+# Show manual mapping UI if discovery already done
+forms_info = st.session_state.get("forms_info")
+
+if forms_info:
+    st.subheader("Manual mapping")
+    # Choose form
+    form_labels = []
+    default_idx = 0
+    for f in forms_info:
+        label = f'Form {f["index"]} | action: {f["action_url"]} | ' \
+                f'selects: {len(f["selects"])} | looks_like_filter={f["looks_like_filter"]}'
+        form_labels.append(label)
+        if f["looks_like_filter"]:
+            default_idx = forms_info.index(f)
+
+    form_choice = st.selectbox("Form to use", form_labels, index=default_idx)
+    chosen_form = forms_info[form_labels.index(form_choice)]
+    selects = chosen_form["selects"]
+
+    if not selects:
+        st.warning("No <select> found in this form. Try another form.")
+    else:
+        # Build select descriptors
+        sel_labels = []
+        for i, s in enumerate(selects):
+            sample_opts = ", ".join(o["visible"] for o in s["options"][:5])
+            sel_labels.append(
+                f'{i}: name="{s["name"]}" id="{s["id"]}" | ex: [{sample_opts}]'
             )
 
-        with st.spinner("Folge Pagination (falls vorhanden)…"):
-            all_rows = crawl_all_pages(sess, first_soup, pause_s=pause)
+        # Guess roles
+        guessed_uni_idx = next(
+            (i for i, s in enumerate(selects) if guess_select_role(s) == "uni"),
+            0,
+        )
+        guessed_fach_idx = next(
+            (i for i, s in enumerate(selects) if guess_select_role(s) == "fach"),
+            0 if guessed_uni_idx != 0 else (1 if len(selects) > 1 else 0),
+        )
 
-        # Merge possibly missing first_rows
-        ids_seen = {r["ml_id"] for r in all_rows}
-        for r0 in first_rows:
-            if r0["ml_id"] not in ids_seen:
-                all_rows.append(r0)
-                ids_seen.add(r0["ml_id"])
-        all_rows.sort(key=lambda x: int(x["ml_id"]))
+        uni_sel_idx = st.selectbox("Select for UNI", list(range(len(selects))), format_func=lambda i: sel_labels[i], index=guessed_uni_idx)
+        fach_sel_idx = st.selectbox("Select for FACH", list(range(len(selects))), format_func=lambda i: sel_labels[i], index=guessed_fach_idx)
 
-        st.subheader("Ergebnis")
-        st.metric("Anzahl Protokolle", len(all_rows))
+        uni_options = selects[uni_sel_idx]["options"]
+        fach_options = selects[fach_sel_idx]["options"]
 
-        if not all_rows:
-            st.info(
-                "Keine Treffer. Tipp: Passen Sie den sichtbaren Text der Filter an "
-                "(z. B. „TU Dresden“ oder „Innere“)."
-            )
-        else:
-            df = pd.DataFrame(all_rows)
+        uni_opt_visibles = [o["visible"] for o in uni_options]
+        fach_opt_visibles = [o["visible"] for o in fach_options]
 
-            if enrich:
-                with st.spinner("Lese Details aus jeder Protokoll-Seite…"):
-                    extra: List[Dict[str, str]] = []
-                    for i, row in enumerate(all_rows, start=1):
-                        st.write(f"Detail {i}/{len(all_rows)} – {row['url']}")
-                        extra.append(fetch_detail_fields(sess, row["url"]))
-                        time.sleep(0.15)
-                    extra_df = pd.DataFrame(extra)
-                    df = pd.concat(
-                        [df.reset_index(drop=True), extra_df.reset_index(drop=True)], axis=1
+        uni_choice = st.selectbox("UNI option (visible text)", uni_opt_visibles, index=0 if not uni_opt_visibles else 0)
+        fach_choice = st.selectbox("FACH option (visible text)", fach_opt_visibles, index=0 if not fach_opt_visibles else 0)
+
+        run_manual = st.button("📤 Manual: submit & count")
+
+        if run_manual:
+            try:
+                payload = dict(chosen_form["hidden"])  # CSRF etc.
+                # add chosen option values
+                payload[selects[uni_sel_idx]["name"]] = next(
+                    o["value"] for o in uni_options if o["visible"] == uni_choice
+                )
+                payload[selects[fach_sel_idx]["name"]] = next(
+                    o["value"] for o in fach_options if o["visible"] == fach_choice
+                )
+                # include submit button if present
+                # (scan raw form html for an input[type=submit] name/value pair)
+                # simple heuristic: not strictly needed on many forms.
+                first_html = post_form(sess, chosen_form["action_url"], payload)
+                all_rows = crawl_all_pages_html(sess, first_html, pause_s=pause)
+
+                st.subheader("Ergebnis (Manual)")
+                st.metric("Anzahl Protokolle", len(all_rows))
+                if all_rows:
+                    df = pd.DataFrame(all_rows)
+                    base_cols = ["ml_id", "title", "url"]
+                    df = df[base_cols + [c for c in df.columns if c not in base_cols]]
+                    st.dataframe(df, use_container_width=True)
+                    csv = df.to_csv(index=False).encode("utf-8")
+                    st.download_button(
+                        "⬇️ CSV herunterladen",
+                        data=csv,
+                        file_name="medi_learn_protokolle_manual.csv",
+                        mime="text/csv",
                     )
+                else:
+                    st.info("Keine Treffer. Prüfe gewählte Optionen/Formular.")
+            except Exception as e:
+                st.error(f"Fehler (Manual): {e}")
 
+# Auto mode: keep original behavior
+if run_auto:
+    try:
+        with st.spinner("Auto: lade Startseite & detektiere Formular…"):
+            start_html = sess.get(START_URL, headers=HEADERS, timeout=30).text
+        # Build forms info from HTML we already have
+        soup = BeautifulSoup(start_html, "html.parser")
+        forms = soup.find_all("form")
+        target_form = None
+        for frm in forms:
+            if form_has_filters(frm):
+                target_form = frm
+                break
+        if not target_form:
+            target_form = forms[0] if forms else None
+        if not target_form:
+            raise RuntimeError("No <form> found on start page.")
+
+        action = target_form.get("action") or START_URL
+        action_url = absolute_url(START_URL, action) or START_URL
+        payload = collect_hidden_inputs(target_form)
+
+        # try to auto map selects
+        selects_bs = list(target_form.find_all("select"))
+        uni_name = fach_name = None
+        uni_val = fach_val = None
+
+        def pick_from_bs(sel, wanted):
+            opts = []
+            for o in sel.find_all("option"):
+                vis = (o.get_text(strip=True) or "").strip()
+                if not vis:
+                    continue
+                val = o.get("value", vis) or vis
+                opts.append({"visible": vis, "value": val})
+            return pick_option_value(opts, wanted)
+
+        # role-based first
+        for sel in selects_bs:
+            sel_name = sel.get("name") or ""
+            sel_id = sel.get("id") or ""
+            ctx = sel.find_parent().get_text(" ", strip=True) if sel.find_parent() else ""
+            role = guess_select_role(
+                {
+                    "name": sel_name,
+                    "id": sel_id,
+                    "context": ctx,
+                    "options": [
+                        {"visible": (o.get_text(strip=True) or "").strip(), "value": o.get("value", "") or ""}
+                        for o in sel.find_all("option")
+                    ],
+                }
+            )
+            if role == "uni" and uni_val is None:
+                v, _ = pick_from_bs(sel, uni_auto)
+                if v:
+                    uni_val = v
+                    uni_name = sel.get("name")
+            if role == "fach" and fach_val is None:
+                v, _ = pick_from_bs(sel, fach_auto)
+                if v:
+                    fach_val = v
+                    fach_name = sel.get("name")
+
+        # fallback: any select containing target visible text
+        if not uni_val:
+            for sel in selects_bs:
+                v, _ = pick_from_bs(sel, uni_auto)
+                if v:
+                    uni_val = v
+                    uni_name = sel.get("name")
+                    break
+        if not fach_val:
+            for sel in selects_bs:
+                v, _ = pick_from_bs(sel, fach_auto)
+                if v:
+                    fach_val = v
+                    fach_name = sel.get("name")
+                    break
+
+        if not uni_name or not fach_name or not uni_val or not fach_val:
+            raise RuntimeError(
+                "Could not map both filters. "
+                f"Resolved → uni: name={uni_name} val={uni_val}, "
+                f"fach: name={fach_name} val={fach_val}"
+            )
+
+        payload[uni_name] = uni_val
+        payload[fach_name] = fach_val
+
+        first_html = post_form(sess, action_url, payload)
+        all_rows = crawl_all_pages_html(sess, first_html, pause_s=pause)
+
+        st.subheader("Ergebnis (Auto)")
+        st.metric("Anzahl Protokolle", len(all_rows))
+        if all_rows:
+            df = pd.DataFrame(all_rows)
             base_cols = ["ml_id", "title", "url"]
-            extra_cols = [c for c in df.columns if c not in base_cols]
-            df = df[base_cols + extra_cols]
-
+            df = df[base_cols + [c for c in df.columns if c not in base_cols]]
             st.dataframe(df, use_container_width=True)
-
             csv = df.to_csv(index=False).encode("utf-8")
             st.download_button(
                 "⬇️ CSV herunterladen",
                 data=csv,
-                file_name=(
-                    f"medi_learn_protokolle_form_"
-                    f"{norm(uni).replace(' ', '_')}_"
-                    f"{norm(fach).replace(' ', '_')}.csv"
-                ),
+                file_name="medi_learn_protokolle_auto.csv",
                 mime="text/csv",
             )
-
-        st.divider()
-        st.markdown(
-            "**Tipps:** Versuchen Sie Varianten des sichtbaren Texts "
-            "(z. B. „TU Dresden“), falls die Seite andere Bezeichnungen nutzt."
-        )
-    except Exception as exc:  # noqa: BLE001
-        st.error(f"Fehler: {exc}")
+        else:
+            st.info(
+                "Keine Treffer in Auto-Modus. Klicken Sie links auf "
+                "„Discover forms & selects“ und nutzen Sie die manuelle Zuordnung."
+            )
+    except Exception as exc:
+        st.error(f"Fehler (Auto): {exc}")
