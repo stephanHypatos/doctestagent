@@ -35,14 +35,16 @@ NEXT_TEXTS = ("weiter", "nächste", "next", "»", "›", ">")
 def new_session() -> requests.Session:
     s = requests.Session()
     s.headers.update(BROWSER_HEADERS)
-    # calm cookie overlay
-    s.cookies.set("CookieConsent", "true", domain="www.medi-learn.de")
-    s.cookies.set("CookieConsentBulkSetting-", "1", domain="www.medi-learn.de")
+    # consent cookies on both apex + www
+    for dom in (".medi-learn.de", "www.medi-learn.de"):
+        s.cookies.set("CookieConsent", "true", domain=dom)
+        s.cookies.set("CookieConsentBulkSetting-", "1", domain=dom)
     return s
 
 def to_soup(resp: requests.Response) -> BeautifulSoup:
+    enc = resp.encoding or "utf-8"
     try:
-        text = resp.content.decode(resp.encoding or "latin-1", errors="ignore")
+        text = resp.content.decode(enc, errors="ignore")
     except Exception:
         text = resp.content.decode("latin-1", errors="ignore")
     return BeautifulSoup(text, "html.parser")
@@ -51,31 +53,45 @@ def to_soup(resp: requests.Response) -> BeautifulSoup:
 def find_select(soup: BeautifulSoup, name_or_id: str) -> Optional[BeautifulSoup]:
     return soup.find("select", id=name_or_id) or soup.find("select", attrs={"name": name_or_id})
 
-def option_value_for_visible(select_el: BeautifulSoup, wanted_visible: str,
-                             defaults: dict[str, str] | None = None) -> Tuple[str, str]:
+def option_value_for_visible(
+    select_el: BeautifulSoup,
+    wanted_visible: str,
+    defaults: dict[str, str] | None = None,
+) -> Tuple[str, str]:
     field_name = select_el.get("name") or select_el.get("id") or ""
     want = (wanted_visible or "").strip().lower()
 
+    # exact
     for opt in select_el.find_all("option"):
         vis = (opt.get_text(strip=True) or "").strip()
         if vis and vis.lower() == want:
             return field_name, (opt.get("value") or vis)
+
+    # contains
     for opt in select_el.find_all("option"):
         vis = (opt.get_text(strip=True) or "").strip()
         if vis and want in vis.lower():
             return field_name, (opt.get("value") or vis)
+
+    # site-specific defaults you showed (Dresden=5, Innere Medizin=20)
     if defaults and want in defaults:
         return field_name, defaults[want]
+
+    # fallback: first non-empty option
     for opt in select_el.find_all("option"):
         vis = (opt.get_text(strip=True) or "").strip()
         if vis:
             return field_name, (opt.get("value") or vis)
+
     return field_name, wanted_visible
 
-def read_option_values(sess: requests.Session, uni_visible: str, fach_visible: str) -> Tuple[Dict[str, str], BeautifulSoup]:
+def read_option_values(
+    sess: requests.Session, uni_visible: str, fach_visible: str
+) -> Tuple[Dict[str, str], BeautifulSoup]:
     r = sess.get(LIST_URL, timeout=30)
     r.raise_for_status()
     soup = to_soup(r)
+
     uni_sel = find_select(soup, "FppUni")
     fach_sel = find_select(soup, "FppFach")
     if not uni_sel or not fach_sel:
@@ -87,15 +103,28 @@ def read_option_values(sess: requests.Session, uni_visible: str, fach_visible: s
     )
     return {name_uni: str(val_uni), name_fach: str(val_fach)}, soup
 
-def make_params(sel_vals: Dict[str, str], rows_per_page: int, page_nr: int = 1) -> Dict[str, str]:
-    return {
+def make_params(
+    sel_vals: Dict[str, str],
+    rows_per_page: int,
+    page_nr: int = 1,
+) -> Dict[str, str]:
+    """
+    Build GET params exactly like the site expects.
+    Includes:
+      - FppPruefer=0 (alle)
+      - BOTH spellings for order key (misspelled FppOpdreBy and correct FppOrderBy)
+    """
+    base = {
         "FppStatus": "1",
-        **sel_vals,
+        "FppPruefer": "0",
         "FppSeitenlaenge": str(rows_per_page),
         "FppSeiteNr": str(page_nr),
-        "FppOrderBy": "erstellt DESC",
         "auswahlstarten": "auswahlstarten",
+        "FppOpdreBy": "erstellt DESC",  # misspelled (seen in DOM)
+        "FppOrderBy": "erstellt DESC",  # correct (belt-and-suspenders)
     }
+    base.update(sel_vals)  # adds FppUni + FppFach
+    return base
 
 # ----------------- Endpoint discovery (AJAX) -----------------
 LOAD_URL_PAT = re.compile(
@@ -107,7 +136,6 @@ LOAD_URL_PAT = re.compile(
 )
 
 def discover_ajax_endpoint(start_soup: BeautifulSoup, sess: requests.Session) -> Optional[str]:
-    # Find .js files included on the page and scan for .load("...") or url: "..."
     for script in start_soup.find_all("script", src=True):
         src = urllib.parse.urljoin(LIST_URL, script["src"])
         try:
@@ -134,7 +162,7 @@ def get_results_table(soup: BeautifulSoup) -> Optional[BeautifulSoup]:
     return soup.find("table", class_=re.compile(r"\bdiensttabelle\b", re.I))
 
 def extract_rows(table: BeautifulSoup) -> List[Dict[str, str]]:
-    rows: List[Dict[str, str]] = []
+    out: List[Dict[str, str]] = []
     tbody = table.find("tbody") or table
     for tr in tbody.find_all("tr"):
         tds = tr.find_all("td")
@@ -152,7 +180,7 @@ def extract_rows(table: BeautifulSoup) -> List[Dict[str, str]]:
             continue
         ml_id = m.group(1)
         url = urllib.parse.urljoin(LIST_URL, a["href"])
-        rows.append(
+        out.append(
             {
                 "ml_id": ml_id,
                 "ort_uni": (ort or "").strip(),
@@ -164,8 +192,9 @@ def extract_rows(table: BeautifulSoup) -> List[Dict[str, str]]:
             }
         )
     # de-dup
-    uniq, seen = [], set()
-    for r in rows:
+    seen: set[str] = set()
+    uniq: List[Dict[str, str]] = []
+    for r in out:
         if r["ml_id"] in seen:
             continue
         seen.add(r["ml_id"])
@@ -183,24 +212,33 @@ def find_next_url_in_container(soup: BeautifulSoup) -> Optional[str]:
     return None
 
 # ----------------- Fetch results (multi-strategy) -----------------
-def fetch_results_page(sess: requests.Session, params: Dict[str, str], start_soup: BeautifulSoup,
-                       debug: bool = False) -> BeautifulSoup:
-    # Strategy 1: simple GET to main URL with params (some setups return full page)
+def fetch_results_page(
+    sess: requests.Session,
+    params: Dict[str, str],
+    start_soup: BeautifulSoup,
+    debug: bool = False,
+) -> BeautifulSoup:
+    # Strategy 1: simple GET with params (some installs return full page)
     url = f"{LIST_URL}?{urllib.parse.urlencode(params)}"
     r = sess.get(url, timeout=30, allow_redirects=True)
     soup = to_soup(r)
+    if debug:
+        st.caption(f"GET full page → {r.url} (HTTP {r.status_code}, bytes={len(r.content)})")
     if get_results_table(soup):
         return soup
 
-    # Strategy 2: discover AJAX endpoint from included JS and call with XHR headers
+    # Strategy 2: discover AJAX endpoint from page JS and call with XHR
     endpoint = discover_ajax_endpoint(start_soup, sess)
+    if debug:
+        st.caption(f"Discovered AJAX endpoint: {endpoint or 'None'}")
     if endpoint:
         r2 = sess.get(endpoint, params=params, headers=XHR_HEADERS, timeout=30)
         s2 = to_soup(r2)
-        # if it's a fragment, wrap into a container so parser finds the table
+        if debug:
+            st.caption(f"XHR → {r2.url} (HTTP {r2.status_code}, bytes={len(r2.content)})")
         if get_results_table(s2):
             return s2
-        # sometimes endpoint returns just the container; ensure we still pass it on
+        # sometimes the endpoint returns just the container/table; wrap it
         cont = s2.find("div", id="FacharztpruefungsprotokollContainer") or s2.find(
             "table", class_=re.compile(r"\bdiensttabelle\b", re.I)
         )
@@ -209,7 +247,7 @@ def fetch_results_page(sess: requests.Session, params: Dict[str, str], start_sou
             wrapper.div.append(cont)
             return wrapper
 
-    # Strategy 3: try common guesses (rarely needed)
+    # Strategy 3: try a few common guesses
     guesses = [
         urllib.parse.urljoin(LIST_URL, "FacharztProtokolle.php"),
         urllib.parse.urljoin(LIST_URL, "facharztprotokolle.php"),
@@ -218,13 +256,11 @@ def fetch_results_page(sess: requests.Session, params: Dict[str, str], start_sou
     for g in guesses:
         r3 = sess.get(g, params=params, headers=XHR_HEADERS, timeout=30)
         s3 = to_soup(r3)
+        if debug:
+            st.caption(f"Guess XHR → {r3.url} (HTTP {r3.status_code}, bytes={len(r3.content)})")
         if get_results_table(s3):
             return s3
 
-    # If we got here, surface a helpful error
-    snippet = str(soup)[:1200]
-    if debug:
-        st.code(snippet, language="html")
     raise RuntimeError("Results table not found (AJAX endpoint likely different).")
 
 # ----------------- Details -----------------
@@ -233,14 +269,21 @@ def fetch_detail_text(sess: requests.Session, url: str) -> str:
     if r.status_code != 200:
         return ""
     try:
-        text = r.content.decode(r.encoding or "latin-1", errors="ignore")
+        text = r.content.decode(r.encoding or "utf-8", errors="ignore")
     except Exception:
         text = r.content.decode("latin-1", errors="ignore")
     return BeautifulSoup(text, "html.parser").get_text(" ", strip=True)
 
 # ----------------- Workflow -----------------
-def crawl_all(sess: requests.Session, uni_visible: str, fach_visible: str, rows_per_page: int,
-              max_pages: int, pause_pages: float, debug: bool=False) -> List[Dict[str, str]]:
+def crawl_all(
+    sess: requests.Session,
+    uni_visible: str,
+    fach_visible: str,
+    rows_per_page: int,
+    max_pages: int,
+    pause_pages: float,
+    debug: bool = False,
+) -> List[Dict[str, str]]:
     sel_vals, start_soup = read_option_values(sess, uni_visible, fach_visible)
     params = make_params(sel_vals, rows_per_page, page_nr=1)
     first_soup = fetch_results_page(sess, params, start_soup, debug=debug)
@@ -270,7 +313,9 @@ def crawl_all(sess: requests.Session, uni_visible: str, fach_visible: str, rows_
     out.sort(key=lambda x: int(x["ml_id"]))
     return out
 
-def enrich_with_details(sess: requests.Session, rows: List[Dict[str, str]], pause_details: float) -> pd.DataFrame:
+def enrich_with_details(
+    sess: requests.Session, rows: List[Dict[str, str]], pause_details: float
+) -> pd.DataFrame:
     out = []
     for r in rows:
         txt = fetch_detail_text(sess, r["url"])
@@ -280,7 +325,16 @@ def enrich_with_details(sess: requests.Session, rows: List[Dict[str, str]], paus
         if pause_details:
             time.sleep(pause_details)
     df = pd.DataFrame(out)
-    cols = ["ml_id", "ort_uni", "fachrichtung", "pruefer", "eingefuegt", "url", "title", "detail_text"]
+    cols = [
+        "ml_id",
+        "ort_uni",
+        "fachrichtung",
+        "pruefer",
+        "eingefuegt",
+        "url",
+        "title",
+        "detail_text",
+    ]
     return df[cols]
 
 # ----------------- Streamlit UI -----------------
@@ -301,7 +355,7 @@ with st.sidebar:
     load_details = st.checkbox("Detailseiten-Text mitladen", value=True)
     pause_details = st.slider("Pause zw. Detail-Seiten (s)", 0.0, 1.0, 0.05, 0.05)
 
-    debug = st.checkbox("Debug: zeige HTML-Snippets, wenn Tabelle fehlt", value=False)
+    debug = st.checkbox("Debug: zeige Netzwerk-Infos", value=False)
     go = st.button("🔎 Start")
 
 if go:
@@ -321,13 +375,15 @@ if go:
         st.metric("Anzahl Protokolle", len(rows))
 
         if not rows:
-            st.info("Keine Ergebnisse – prüfe Schreibweise (exakt sichtbarer Text) oder erhöhe die Seitenzahl.")
+            st.info("Keine Ergebnisse – prüfe die sichtbaren Texte oder erhöhe die Seitenzahl.")
         else:
             if load_details:
                 with st.spinner("Detailseiten laden …"):
                     df = enrich_with_details(sess, rows, float(pause_details))
             else:
-                df = pd.DataFrame(rows)[["ml_id", "ort_uni", "fachrichtung", "pruefer", "eingefuegt", "url", "title"]]
+                df = pd.DataFrame(rows)[
+                    ["ml_id", "ort_uni", "fachrichtung", "pruefer", "eingefuegt", "url", "title"]
+                ]
 
             st.dataframe(df, use_container_width=True)
             csv = df.to_csv(index=False).encode("utf-8")
