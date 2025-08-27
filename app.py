@@ -1,214 +1,407 @@
 import re
 import time
 import html
+import urllib.parse
 import requests
 import pandas as pd
 from bs4 import BeautifulSoup
 import streamlit as st
 
-# -----------------------
-# Settings / Constants
-# -----------------------
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/124.0.0.0 Safari/537.36"
-}
-DDG_HTML = "https://duckduckgo.com/html/"
-DETAIL_PATTERN = re.compile(r"https?://(?:www\.)?medi-learn\.de/pruefungsprotokolle/facharztpruefung/detailed\.php\?ID=\d+", re.I)
+# ======================================
+# Settings
+# ======================================
+BASE_URL = "https://www.medi-learn.de"
+START_PATH = "/pruefungsprotokolle/facharztpruefung/"
+START_URL = urllib.parse.urljoin(BASE_URL, START_PATH)
 
-# -----------------------
-# Helpers
-# -----------------------
-@st.cache_data(show_spinner=False)
-def ddg_site_search(query: str, max_pages: int = 5, sleep_s: float = 0.8) -> list[str]:
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+      "AppleWebKit/537.36 (KHTML, like Gecko) "
+      "Chrome/124.0.0.0 Safari/537.36")
+
+HEADERS = {"User-Agent": UA}
+DETAIL_RE = re.compile(r"detailed\.php\?ID=(\d+)", re.I)
+
+# ======================================
+# Utilities
+# ======================================
+def norm(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip()).lower()
+
+def absolute_url(base: str, href: str | None) -> str | None:
+    if not href:
+        return None
+    return urllib.parse.urljoin(base, href)
+
+def get_soup(session: requests.Session, url: str) -> BeautifulSoup:
+    r = session.get(url, headers=HEADERS, timeout=30)
+    r.raise_for_status()
+    return BeautifulSoup(r.text, "lxml")
+
+def get_forms(soup: BeautifulSoup):
+    return soup.find_all("form")
+
+def form_has_filters(form: BeautifulSoup) -> bool:
+    """Heuristic: does this form look like the one with Uni/Fach filters?"""
+    txt = form.get_text(" ", strip=True).lower()
+    # Look for typical German labels/keywords around those filters
+    needles = ["uni", "universität", "standort", "ort", "fach", "fachgebiet", "innere", "medizin"]
+    score = sum(1 for n in needles if n in txt)
+    # Also check selects count
+    has_selects = bool(form.find_all("select"))
+    return has_selects and score >= 2
+
+def collect_hidden_inputs(form: BeautifulSoup) -> dict:
+    data = {}
+    for el in form.select("input[type=hidden]"):
+        name = el.get("name")
+        if not name:
+            continue
+        data[name] = el.get("value", "")
+    return data
+
+def option_map_by_text(select: BeautifulSoup) -> dict:
     """
-    Scrape DuckDuckGo's HTML endpoint for query results (no API key required).
-    Returns a list of result URLs (strings).
+    Return {normalized_visible_text: (value, visible_text)} for all <option>.
     """
-    urls = set()
-    next_form_data = None
+    out = {}
+    for opt in select.find_all("option"):
+        vis = opt.get_text(strip=True)
+        val = opt.get("value", vis)
+        if not vis:
+            continue
+        out[norm(vis)] = (val, vis)
+    return out
 
-    for page in range(max_pages):
-        params = {"q": query}
-        if next_form_data:
-            # use "s" for pagination offset if provided by DDG
-            params.update(next_form_data)
+def find_selects(form: BeautifulSoup):
+    selects = form.find_all("select")
+    return selects
 
-        resp = requests.get(DDG_HTML, params=params, headers=HEADERS, timeout=20)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
+def guess_select_role(select: BeautifulSoup) -> str | None:
+    """
+    Try to guess if a select is for 'uni' or 'fach' based on label, name, id, or option texts.
+    """
+    name = (select.get("name") or "").lower()
+    sid = (select.get("id") or "").lower()
+    around = select.find_parent().get_text(" ", strip=True).lower()
 
-        for a in soup.select("a.result__url, a.result__a, a.result__snippet a"):
-            href = a.get("href")
-            if not href:
-                continue
-            # Unescape HTML entities
-            href = html.unescape(href)
-            # Only accept ML detailed pages
-            m = DETAIL_PATTERN.search(href)
-            if m:
-                urls.add(m.group(0))
+    uni_tokens = ["uni", "universität", "standort", "ort", "tu dresden", "dresden"]
+    fach_tokens = ["fach", "fachgebiet", "innere", "medizin", "chirurgie", "neurologie"]
 
-        # Find "Next" form to continue pagination (if present)
-        next_btn = soup.find("a", string=re.compile(r"Next", re.I))
-        if not next_btn:
+    # name/id heuristic
+    if any(t in name or t in sid for t in ["uni", "standort", "ort"]):
+        return "uni"
+    if any(t in name or t in sid for t in ["fach", "fachgebiet", "gebiet"]):
+        return "fach"
+
+    # nearby text heuristic
+    if any(t in around for t in uni_tokens):
+        return "uni"
+    if any(t in around for t in fach_tokens):
+        return "fach"
+
+    # option-content heuristic: if many options look like cities/unis vs. specialties
+    opts = [norm(o.get_text(strip=True)) for o in select.find_all("option")]
+    city_hits = sum(1 for o in opts if any(c in o for c in ["berlin", "münchen", "hamburg", "dresden", "köln", "hannover", "frankfurt"]))
+    fach_hits = sum(1 for o in opts if any(f in o for f in ["innere", "chirurgie", "neurologie", "anästhesie", "derma", "gyn"]))
+    if city_hits > fach_hits:
+        return "uni"
+    if fach_hits > city_hits:
+        return "fach"
+    return None
+
+def pick_option_value(select: BeautifulSoup, wanted_text: str) -> tuple[str | None, str | None]:
+    """
+    Match user 'wanted_text' against visible option text (case/space-insensitive).
+    Returns (value, visible_text) or (None, None).
+    """
+    omap = option_map_by_text(select)
+    key = norm(wanted_text)
+    # direct
+    if key in omap:
+        return omap[key]
+    # fuzzy: startswith or contains
+    for k, (v, vis) in omap.items():
+        if k.startswith(key) or key in k or k in key:
+            return v, vis
+    return None, None
+
+def extract_result_rows(soup: BeautifulSoup) -> list[dict]:
+    """
+    Extract links to detailed.php?ID=… and some small info from the result page.
+    """
+    rows = []
+    # Strategy: any anchor that contains detailed.php?ID=…
+    for a in soup.find_all("a", href=True):
+        m = DETAIL_RE.search(a["href"])
+        if not m:
+            continue
+        ml_id = m.group(1)
+        url = absolute_url(START_URL, a["href"])
+        title = a.get_text(" ", strip=True) or f"Protokoll {ml_id}"
+        rows.append({"ml_id": ml_id, "title": title, "url": url})
+    # De-dup by ml_id
+    seen = set()
+    uniq = []
+    for r in rows:
+        if r["ml_id"] in seen:
+            continue
+        seen.add(r["ml_id"])
+        uniq.append(r)
+    return uniq
+
+def find_next_page_url(soup: BeautifulSoup) -> str | None:
+    """
+    Try to find 'next' pagination link (weiter, nächste, >, etc.).
+    """
+    # Look for anchors with typical next labels
+    candidates = []
+    for a in soup.find_all("a", href=True):
+        txt = a.get_text(" ", strip=True).lower()
+        if any(t in txt for t in ["weiter", "nächste", "next", "»", "›", ">"]):
+            candidates.append(a["href"])
+    if not candidates:
+        return None
+    # Prefer the first that stays within the same tool path
+    for href in candidates:
+        full = absolute_url(START_URL, href)
+        if "/pruefungsprotokolle/facharztpruefung" in full:
+            return full
+    return absolute_url(START_URL, candidates[0])
+
+def submit_filter(session: requests.Session, start_soup: BeautifulSoup, uni_text: str, fach_text: str) -> tuple[list[dict], BeautifulSoup]:
+    """
+    Locate the filter form, select the desired Uni & Fach by visible text,
+    POST it, parse the first result page, and return (rows, soup).
+    """
+    forms = get_forms(start_soup)
+    target_form = None
+    for f in forms:
+        if form_has_filters(f):
+            target_form = f
             break
-
-        # DDG html pagination can also be handled by grabbing the hidden form fields, but
-        # often just increasing offset works. We'll try to read "s=" from the href.
-        next_href = next_btn.get("href") or ""
-        # Extract s= param
-        s_match = re.search(r"[?&]s=(\d+)", next_href)
-        if s_match:
-            next_form_data = {"s": s_match.group(1)}
+    if not target_form:
+        # fallback: first form
+        if forms:
+            target_form = forms[0]
         else:
-            next_form_data = None
+            raise RuntimeError("No <form> found on start page.")
 
-        time.sleep(sleep_s)
+    action = target_form.get("action") or START_URL
+    action_url = absolute_url(START_URL, action)
 
-    return sorted(urls)
+    payload = collect_hidden_inputs(target_form)
 
+    # Identify selects and pick values
+    selects = find_selects(target_form)
+    uni_name = fach_name = None
+    uni_val = fach_val = None
+    for sel in selects:
+        role = guess_select_role(sel)
+        if role == "uni":
+            v, vis = pick_option_value(sel, uni_text)
+            if v:
+                uni_val = v
+                uni_name = sel.get("name")
+        elif role == "fach":
+            v, vis = pick_option_value(sel, fach_text)
+            if v:
+                fach_val = v
+                fach_name = sel.get("name")
 
-def fetch_and_check(url: str, uni_kw: str, fach_kw: str, timeout: int = 20) -> dict | None:
+    # If roles weren’t guessed, try best-effort by presence of the desired text in options
+    if not uni_val:
+        for sel in selects:
+            v, vis = pick_option_value(sel, uni_text)
+            if v:
+                uni_val = v
+                uni_name = sel.get("name")
+                break
+
+    if not fach_val:
+        for sel in selects:
+            v, vis = pick_option_value(sel, fach_text)
+            if v:
+                fach_val = v
+                fach_name = sel.get("name")
+                break
+
+    if not uni_name or not fach_name or not uni_val or not fach_val:
+        raise RuntimeError(
+            f"Could not map both filters. "
+            f"Resolved -> uni: name={uni_name} val={uni_val}, fach: name={fach_name} val={fach_val}"
+        )
+
+    payload[uni_name] = uni_val
+    payload[fach_name] = fach_val
+
+    # Try to detect submit button name/value (some forms require it)
+    submit = target_form.find("input", {"type": "submit"})
+    if submit and submit.get("name"):
+        payload[submit["name"]] = submit.get("value", "Suchen")
+
+    # Send POST
+    r = session.post(action_url, data=payload, headers=HEADERS, timeout=30)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "lxml")
+    rows = extract_result_rows(soup)
+    return rows, soup
+
+def crawl_all_pages(session: requests.Session, first_soup: BeautifulSoup, pause_s: float = 0.5) -> list[dict]:
     """
-    Download Medi-Learn detail page and verify that both the Uni keyword and Fach keyword
-    occur in the page text. Returns a record (dict) if it matches, else None.
+    Starting from the first results page soup, follow pagination and aggregate rows.
+    """
+    all_rows = extract_result_rows(first_soup)
+    seen_ids = {r["ml_id"] for r in all_rows}
+
+    next_url = find_next_page_url(first_soup)
+    safety = 0
+    while next_url and safety < 30:
+        safety += 1
+        time.sleep(pause_s)
+        r = session.get(next_url, headers=HEADERS, timeout=30)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "lxml")
+        rows = extract_result_rows(soup)
+        for r_ in rows:
+            if r_["ml_id"] not in seen_ids:
+                seen_ids.add(r_["ml_id"])
+                all_rows.append(r_)
+        next_url = find_next_page_url(soup)
+    # sort by id numeric
+    all_rows.sort(key=lambda x: int(x["ml_id"]))
+    return all_rows
+
+def fetch_detail_fields(session: requests.Session, url: str) -> dict:
+    """
+    Optional enrichment: fetch each detail page and try to extract 'Uni' and 'Fach'
+    and maybe Atmosphere/Prüfer fields for quick display.
     """
     try:
-        r = requests.get(url, headers=HEADERS, timeout=timeout)
+        r = session.get(url, headers=HEADERS, timeout=30)
         r.raise_for_status()
-    except Exception as e:
-        return None
+        soup = BeautifulSoup(r.text, "lxml")
+        text = soup.get_text(" ", strip=True)
+        low = text.lower()
 
-    soup = BeautifulSoup(r.text, "html.parser")
-    text = soup.get_text(" ", strip=True).lower()
+        def grab(label_variants):
+            for lab in label_variants:
+                m = re.search(lab, low)
+                if m:
+                    # take the next ~150 chars as snippet
+                    start = m.end()
+                    snippet = text[start:start+150]
+                    snippet = re.split(r"[\n\r|•\-]{2,}|  ", snippet)[0]
+                    return snippet.strip(":; \n\r\t")
+            return ""
 
-    if uni_kw.lower() not in text or fach_kw.lower() not in text:
-        return None
+        uni_guess = grab([r"\buni\b", r"universit[aä]t", r"dresden"])
+        fach_guess = grab([r"\bfach\b", r"fachgebiet", r"innere", r"medizin"])
+        atm = grab([r"atmosph[aä]re", r"stimmung"])
+        pruefer = grab([r"pr[üu]fer", r"vorsitz", r"kommission"])
 
-    # Try to extract a useful title (fallback to URL)
-    title = soup.title.get_text(strip=True) if soup.title else url
+        title = soup.title.get_text(strip=True) if soup.title else url
+        return {
+            "title_detail": title,
+            "uni_guess": uni_guess,
+            "fach_guess": fach_guess,
+            "atmosphaere": atm,
+            "pruefer": pruefer
+        }
+    except Exception:
+        return {
+            "title_detail": "",
+            "uni_guess": "",
+            "fach_guess": "",
+            "atmosphaere": "",
+            "pruefer": ""
+        }
 
-    # Optional: try to grab “Atmosphäre” or “Prüfer” lines when present
-    # These fields vary — we’ll do best-effort fuzzy extraction.
-    def extract_line(label_patterns: list[str]) -> str | None:
-        # Look for label-like text
-        for lab in label_patterns:
-            m = re.search(lab, text, re.I)
-            if m:
-                # If we matched, try to capture a short snippet following it
-                idx = m.end()
-                snippet = text[idx: idx + 180]
-                # Stop at next label-like boundary
-                snippet = re.split(r"(?:\n|  |  |•|-{2,}|={2,}|[|])", snippet)[0]
-                return snippet.strip(":; \n\r\t")
-        return None
-
-    atm = extract_line([r"atmosph[aä]re\s*[:\-]?", r"stimmung\s*[:\-]?"])
-    pruefer = extract_line([r"pr[üu]fer\s*[:\-]?", r"vorsitz\s*[:\-]?", r"kommission\s*[:\-]?"])
-
-    return {
-        "title": title,
-        "url": url,
-        "uni_match": uni_kw,
-        "fach_match": fach_kw,
-        "atmosphaere_guess": atm,
-        "pruefer_guess": pruefer,
-    }
-
-
-@st.cache_data(show_spinner=False)
-def collect_matches(uni: str, fach: str, max_pages: int = 5, pause_s: float = 0.6) -> pd.DataFrame:
-    """
-    End-to-end:
-    1) Search DDG: restrict to Medi-Learn detailed.php pages + user keywords.
-    2) Fetch each candidate and verify both keywords are in page text.
-    3) Return DataFrame of matches.
-    """
-    query = f'site:medi-learn.de/pruefungsprotokolle/facharztpruefung "detailed.php?ID=" "{uni}" "{fach}"'
-    candidates = ddg_site_search(query, max_pages=max_pages)
-
-    rows = []
-    for url in candidates:
-        rec = fetch_and_check(url, uni_kw=uni, fach_kw=fach)
-        if rec:
-            rows.append(rec)
-        time.sleep(pause_s)
-
-    if not rows:
-        return pd.DataFrame(columns=["title", "url", "uni_match", "fach_match", "atmosphaere_guess", "pruefer_guess"])
-
-    # De-duplicate by ID
-    def id_from_url(u: str) -> str:
-        m = re.search(r"ID=(\d+)", u, re.I)
-        return m.group(1) if m else u
-
-    df = pd.DataFrame(rows)
-    df["ml_id"] = df["url"].apply(id_from_url)
-    df = df.drop_duplicates(subset=["ml_id"]).sort_values("ml_id", key=lambda s: s.astype(str).str.zfill(6))
-    return df.reset_index(drop=True)
-
-
-# -----------------------
-# UI
-# -----------------------
-st.set_page_config(page_title="Medi-Learn Facharzt-Protokolle Zähler", page_icon="🩺", layout="wide")
-
-st.title("🩺 Medi-Learn Facharzt-Prüfungsprotokolle – Zähler (workaround)")
-st.caption("Search-based workaround that finds detail pages and verifies your filters. Deployable on Streamlit Cloud.")
+# ======================================
+# Streamlit UI
+# ======================================
+st.set_page_config(page_title="Medi-Learn Protokolle – Form Scraper", page_icon="🩺", layout="wide")
+st.title("🩺 Medi-Learn Facharzt-Prüfungsprotokolle — Form-Submission Scraper")
+st.caption("Posts the real Medi-Learn filter form (no search engines). Handles pagination and counts matching Protokolle.")
 
 with st.sidebar:
     st.header("Filter")
-    uni = st.text_input("Universität (z.B. Dresden)", value="Dresden")
-    fach = st.text_input("Fach (z.B. Innere Medizin)", value="Innere Medizin")
-
-    st.header("Advanced")
-    max_pages = st.slider("Max. search pages to crawl", min_value=1, max_value=10, value=5)
-    st.help("If you need broader coverage, increase this — it may take a bit longer.")
-
-    run = st.button("🔎 Search & Count")
+    uni = st.text_input("Universität (sichtbarer Text)", value="Dresden", help="Geben Sie den sichtbaren Uni-Text ein, z. B. „Dresden“, „TU Dresden“, „Uniklinikum Dresden“.")
+    fach = st.text_input("Fach (sichtbarer Text)", value="Innere Medizin", help="Z. B. „Innere Medizin“.")
+    enrich = st.checkbox("Optional: Details aus jeder Protokoll-Seite lesen (langsamer)", value=False)
+    pause = st.slider("Pausenzeit bei Pagination (Sek.)", 0.0, 2.0, 0.5, 0.1)
+    go = st.button("📤 Formular absenden & Zählen")
 
 st.markdown(
     """
-**How this works:**  
-This app uses DuckDuckGo’s public HTML results (no API key) to find Medi-Learn detail pages (`detailed.php?ID=…`) that mention your **Uni** and **Fach**.  
-It then opens each page to verify the match and extracts small snippets (e.g., Prüfer / Atmosphäre) when possible.
+**Hinweis:** Dieses Tool versucht automatisch die richtigen Formularfelder (Uni/Fach) zu erkennen, wählt die Option \
+entsprechend dem **sichtbaren Text** und sendet dann die Anfrage ab.
 """
 )
 
-if run:
-    with st.spinner("Searching and verifying results…"):
-        df = collect_matches(uni=uni.strip(), fach=fach.strip(), max_pages=max_pages)
+if go:
+    try:
+        with st.spinner("Lade Startseite & analysiere Formular…"):
+            sess = requests.Session()
+            sess.headers.update(HEADERS)
+            start_soup = get_soup(sess, START_URL)
 
-    st.subheader("Results")
-    st.metric("Total matching Protokolle", value=len(df))
+        with st.spinner("Sende Formular & lese erste Ergebnisse…"):
+            rows, first_soup = submit_filter(sess, start_soup, uni_text=uni.strip(), fach_text=fach.strip())
 
-    if len(df):
-        # Pretty table
-        st.dataframe(
-            df[["ml_id", "title", "url", "uni_match", "fach_match", "pruefer_guess", "atmosphaere_guess"]],
-            use_container_width=True,
+        with st.spinner("Folge Pagination (falls vorhanden)…"):
+            all_rows = crawl_all_pages(sess, first_soup, pause_s=pause)
+
+        # If the first submit already returned results that might not be included in pagination-driven crawl,
+        # merge them as well:
+        ids_seen = {r["ml_id"] for r in all_rows}
+        for r0 in rows:
+            if r0["ml_id"] not in ids_seen:
+                all_rows.append(r0)
+                ids_seen.add(r0["ml_id"])
+        all_rows.sort(key=lambda x: int(x["ml_id"]))
+
+        st.subheader("Ergebnis")
+        st.metric("Anzahl Protokolle", len(all_rows))
+
+        if not all_rows:
+            st.info("Keine Treffer. Tipp: Passen Sie den sichtbaren Text der Filter an (z. B. „TU Dresden“ oder „Innere“).")
+        else:
+            df = pd.DataFrame(all_rows)
+
+            if enrich:
+                with st.spinner("Lese Details aus jeder Protokoll-Seite…"):
+                    extra = []
+                    for i, row in enumerate(all_rows, start=1):
+                        st.write(f"Detail {i}/{len(all_rows)} – {row['url']}")
+                        extra.append(fetch_detail_fields(sess, row["url"]))
+                        time.sleep(0.15)
+                    extra_df = pd.DataFrame(extra)
+                    df = pd.concat([df.reset_index(drop=True), extra_df.reset_index(drop=True)], axis=1)
+
+            # order columns nicely
+            base_cols = ["ml_id", "title", "url"]
+            extra_cols = [c for c in df.columns if c not in base_cols]
+            df = df[base_cols + extra_cols]
+
+            st.dataframe(df, use_container_width=True)
+
+            csv = df.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "⬇️ CSV herunterladen",
+                data=csv,
+                file_name=f"medi_learn_protokolle_form_{norm(uni).replace(' ','_')}_{norm(fach).replace(' ','_')}.csv",
+                mime="text/csv"
+            )
+
+        st.divider()
+        st.markdown(
+            """
+            **Tipps:**
+            - Nutzen Sie exakt den **sichtbaren Text** der Optionen (z. B. „Innere Medizin“, nicht „Innere“ – je nach Seite).
+            - Probieren Sie Varianten wie „TU Dresden“ vs. „Dresden“.
+            - Wenn die Seite einen CSRF-Token oder zwingende „submit“-Feldnamen verlangt, werden diese automatisch aus dem Formular übernommen.
+            """
         )
 
-        # Download
-        csv = df.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "⬇️ Download CSV",
-            data=csv,
-            file_name=f"medi_learn_protokolle_{uni}_{fach}.csv",
-            mime="text/csv",
-        )
-    else:
-        st.info("No matching detail pages found with the current filters and search depth. "
-                "Try broadening the search (increase pages) or tweak spellings (e.g., 'TU Dresden').")
-
-st.divider()
-st.markdown(
-    """
-### Notes & Tips
-- This is a **workaround**. Medi-Learn’s on-site filters use sessions/JS; this app avoids that by site-searching public detail pages.
-- Try variations like **“TU Dresden”**, **“Uniklinikum Dresden”**, or **“Innere”** if you think exact phrases differ on the pages.
-- You can adapt this to other Fächer (e.g., *Neurologie*, *Chirurgie*) and other Unis.
-"""
-)
+    except Exception as e:
+        st.error(f"Fehler: {e}")
