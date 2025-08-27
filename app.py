@@ -109,19 +109,23 @@ def make_params(
     page_nr: int = 1,
 ) -> Dict[str, str]:
     """
-    Build GET params exactly like the site expects.
+    Build GET params like a real click on the image submit would do.
     Includes:
       - FppPruefer=0 (alle)
       - BOTH spellings for order key (misspelled FppOpdreBy and correct FppOrderBy)
+      - auswahlstarten (name) AND auswahlstarten.x / auswahlstarten.y (coordinates)
     """
     base = {
         "FppStatus": "1",
         "FppPruefer": "0",
         "FppSeitenlaenge": str(rows_per_page),
         "FppSeiteNr": str(page_nr),
-        "auswahlstarten": "auswahlstarten",
         "FppOpdreBy": "erstellt DESC",  # misspelled (seen in DOM)
         "FppOrderBy": "erstellt DESC",  # correct (belt-and-suspenders)
+        # simulate clicking the image submit:
+        "auswahlstarten": "auswahlstarten",
+        "auswahlstarten.x": "12",
+        "auswahlstarten.y": "9",
     }
     base.update(sel_vals)  # adds FppUni + FppFach
     return base
@@ -218,7 +222,7 @@ def fetch_results_page(
     start_soup: BeautifulSoup,
     debug: bool = False,
 ) -> BeautifulSoup:
-    # Strategy 1: simple GET with params (some installs return full page)
+    # Strategy 1: simple GET with params (full page)
     url = f"{LIST_URL}?{urllib.parse.urlencode(params)}"
     r = sess.get(url, timeout=30, allow_redirects=True)
     soup = to_soup(r)
@@ -227,7 +231,7 @@ def fetch_results_page(
     if get_results_table(soup):
         return soup
 
-    # Strategy 2: discover AJAX endpoint from page JS and call with XHR
+    # Strategy 2: discover AJAX endpoint and call with XHR headers
     endpoint = discover_ajax_endpoint(start_soup, sess)
     if debug:
         st.caption(f"Discovered AJAX endpoint: {endpoint or 'None'}")
@@ -238,7 +242,6 @@ def fetch_results_page(
             st.caption(f"XHR → {r2.url} (HTTP {r2.status_code}, bytes={len(r2.content)})")
         if get_results_table(s2):
             return s2
-        # sometimes the endpoint returns just the container/table; wrap it
         cont = s2.find("div", id="FacharztpruefungsprotokollContainer") or s2.find(
             "table", class_=re.compile(r"\bdiensttabelle\b", re.I)
         )
@@ -247,7 +250,7 @@ def fetch_results_page(
             wrapper.div.append(cont)
             return wrapper
 
-    # Strategy 3: try a few common guesses
+    # Strategy 3: common guesses
     guesses = [
         urllib.parse.urljoin(LIST_URL, "FacharztProtokolle.php"),
         urllib.parse.urljoin(LIST_URL, "facharztprotokolle.php"),
@@ -339,7 +342,7 @@ def enrich_with_details(
 
 # ----------------- Streamlit UI -----------------
 st.set_page_config(page_title="Medi-Learn Protokolle — zählen & Details", page_icon="🩺", layout="wide")
-st.title("🩺 Medi-Learn Facharztprüfungsprotokolle — zählen & Details (AJAX-aware)")
+st.title("🩺 Medi-Learn Facharztprüfungsprotokolle — zählen & Details (image-submit fix)")
 
 with st.sidebar:
     st.header("Filter (sichtbarer Text)")
@@ -375,7 +378,7 @@ if go:
         st.metric("Anzahl Protokolle", len(rows))
 
         if not rows:
-            st.info("Keine Ergebnisse – prüfe die sichtbaren Texte oder erhöhe die Seitenzahl.")
+            st.info("Keine Ergebnisse – prüfe sichtbare Texte oder erhöhe die Seitenzahl.")
         else:
             if load_details:
                 with st.spinner("Detailseiten laden …"):
