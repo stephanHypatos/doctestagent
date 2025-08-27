@@ -1,3 +1,16 @@
+import time, csv, json, re
+from pathlib import Path
+from urllib.parse import urljoin, urlencode
+
+import requests
+from bs4 import BeautifulSoup
+import pandas as pd
+import streamlit as st  # <-- must be before any @st.cache_* usage
+
+st.set_page_config(page_title="Medi-Learn Scraper", layout="wide")
+
+
+
 # --- strengthen HTTP defaults ---
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
