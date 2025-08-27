@@ -1,285 +1,210 @@
-from __future__ import annotations
+# streamlit_app.py
+# Run with:  streamlit run streamlit_app.py
 
-import re
 import time
-import urllib.parse
-from typing import Dict, List, Optional, Tuple
+import csv
+import json
+import re
+from pathlib import Path
+from urllib.parse import urljoin, urlencode
 
-import pandas as pd
 import requests
-import streamlit as st
 from bs4 import BeautifulSoup
+import streamlit as st
+import pandas as pd
 
-# ----------------- Constants -----------------
-BASE_URL = "https://www.medi-learn.de"
-LIST_PATH = "/pruefungsprotokolle/facharztpruefung/"
-LIST_URL = urllib.parse.urljoin(BASE_URL, LIST_PATH)
+st.set_page_config(page_title="Medi-Learn Facharzt-Protokolle Scraper", layout="wide")
 
-UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
-)
+BASE_URL = "https://www.medi-learn.de/pruefungsprotokolle/facharztpruefung/"
+DETAIL_PREFIX = "detailed.php?ID="
 HEADERS = {
-    "User-Agent": UA,
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Referer": LIST_URL,
+    "User-Agent": "Mozilla/5.0 (compatible; ML-Protokoll-Scraper/1.0)"
 }
+DEFAULT_SLEEP = 1.0  # polite delay
 
-# capture detailed links anywhere on the page, id parameter case-insensitive, allow extra params/anchors
-DETAIL_RE = re.compile(r"detailed\.php\?[^#\s]*id=(\d+)", re.I)
 
-# ----------------- Session helpers -----------------
-def new_session() -> requests.Session:
-    s = requests.Session()
-    s.headers.update(HEADERS)
-    # consent cookies on both apex + www
-    for dom in (".medi-learn.de", "www.medi-learn.de"):
-        s.cookies.set("CookieConsent", "true", domain=dom)
-        s.cookies.set("CookieConsentBulkSetting-", "1", domain=dom)
-    return s
-
-def to_soup(resp: requests.Response) -> BeautifulSoup:
-    enc = resp.encoding or "utf-8"
-    try:
-        text = resp.content.decode(enc, errors="ignore")
-    except Exception:
-        text = resp.content.decode("latin-1", errors="ignore")
-    return BeautifulSoup(text, "html.parser")
-
-# ----------------- Form helpers -----------------
-def find_select(soup: BeautifulSoup, name_or_id: str) -> Optional[BeautifulSoup]:
-    return soup.find("select", id=name_or_id) or soup.find("select", attrs={"name": name_or_id})
-
-def option_value_for_visible(select_el: BeautifulSoup, wanted_visible: str,
-                             defaults: dict[str, str] | None = None) -> Tuple[str, str]:
-    field_name = select_el.get("name") or select_el.get("id") or ""
-    want = (wanted_visible or "").strip().lower()
-
-    for opt in select_el.find_all("option"):
-        vis = (opt.get_text(strip=True) or "").strip()
-        if vis and vis.lower() == want:
-            return field_name, (opt.get("value") or vis)
-    for opt in select_el.find_all("option"):
-        vis = (opt.get_text(strip=True) or "").strip()
-        if vis and want in vis.lower():
-            return field_name, (opt.get("value") or vis)
-    if defaults and want in defaults:
-        return field_name, defaults[want]
-    for opt in select_el.find_all("option"):
-        vis = (opt.get_text(strip=True) or "").strip()
-        if vis:
-            return field_name, (opt.get("value") or vis)
-    return field_name, wanted_visible
-
-def read_option_values(sess: requests.Session, uni_visible: str, fach_visible: str) -> Dict[str, str]:
-    r = sess.get(LIST_URL, timeout=30)
+@st.cache_data(show_spinner=False)
+def get_soup(url: str, headers: dict | None = None) -> BeautifulSoup:
+    r = requests.get(url, headers=headers or HEADERS, timeout=30)
     r.raise_for_status()
-    soup = to_soup(r)
+    return BeautifulSoup(r.text, "html.parser")
 
-    uni_sel = find_select(soup, "FppUni")
-    fach_sel = find_select(soup, "FppFach")
-    if not uni_sel or not fach_sel:
-        raise RuntimeError("FppUni/FppFach selects not found on the page.")
 
-    name_uni, val_uni = option_value_for_visible(uni_sel, uni_visible, {"dresden": "5"})
-    name_fach, val_fach = option_value_for_visible(
-        fach_sel, fach_visible, {"innere medizin": "20", "innere": "20"}
-    )
-    return {name_uni: str(val_uni), name_fach: str(val_fach)}
+def find_select_value_by_label(soup: BeautifulSoup, select_name: str, text_match: str) -> str | None:
+    sel = soup.find("select", attrs={"name": select_name})
+    if not sel:
+        return None
+    wanted = text_match.casefold()
+    for opt in sel.find_all("option"):
+        visible = (opt.get_text(strip=True) or "").casefold()
+        if wanted in visible:
+            val = opt.get("value")
+            if val:
+                return val
+    return None
 
-def make_params(sel_vals: Dict[str, str], rows_per_page: int, page_nr: int) -> Dict[str, str]:
-    """
-    Build GET params like a real click on the image submit would do.
-    Includes:
-      - FppPruefer=0 (alle)
-      - BOTH spellings for order key (misspelled FppOpdreBy and correct FppOrderBy)
-      - auswahlstarten + image submit coords
-    """
-    base = {
+
+@st.cache_data(show_spinner=False)
+def discover_filter_values() -> dict:
+    """Fetch the search page and map visible labels to (value, select_name)."""
+    soup = get_soup(BASE_URL)
+    uni_opts = []
+    fach_opts = []
+
+    sel_uni = soup.find("select", attrs={"name": "FppUni"})
+    if sel_uni:
+        for o in sel_uni.find_all("option"):
+            t = o.get_text(strip=True)
+            v = o.get("value")
+            if v:
+                uni_opts.append((t, v))
+
+    sel_fach = soup.find("select", attrs={"name": "FppFach"})
+    if sel_fach:
+        for o in sel_fach.find_all("option"):
+            t = o.get_text(strip=True)
+            v = o.get("value")
+            if v:
+                fach_opts.append((t, v))
+
+    return {"uni": uni_opts, "fach": fach_opts}
+
+
+def build_results_url(uni_val: str, fach_val: str, page_nr: int = 1, page_len: int = 40) -> str:
+    params = {
         "FppStatus": "1",
         "FppPruefer": "0",
-        "FppSeitenlaenge": str(rows_per_page),
+        "FppSeitenlaenge": str(page_len),
         "FppSeiteNr": str(page_nr),
-        "FppOpdreBy": "erstellt DESC",   # misspelled (seen in DOM)
-        "FppOrderBy": "erstellt DESC",   # also send correct spelling
+        "FppOpdreBy": "erstellt DESC",
+        "FppOrderBy": "erstellt DESC",
         "auswahlstarten": "auswahlstarten",
-        "auswahlstarten.x": "12",
-        "auswahlstarten.y": "9",
+        "FppUni": uni_val,
+        "FppFach": fach_val,
     }
-    base.update(sel_vals)  # adds FppUni + FppFach
-    return base
+    return f"{BASE_URL}?{urlencode(params)}"
 
-# ----------------- Results extraction (layout-agnostic) -----------------
-def extract_detail_links_anywhere(soup: BeautifulSoup) -> List[Dict[str, str]]:
-    """
-    Robust: scan the entire page for detailed.php?ID=... links and, if available,
-    lift adjacent table-cell info (Ort/Fach/Prüfer/Datum). Works even if the
-    container/table markup differs or is missing.
-    """
-    rows: List[Dict[str, str]] = []
-    seen: set[str] = set()
 
+def extract_detail_links_from_list(soup: BeautifulSoup) -> list[str]:
+    links = []
     for a in soup.find_all("a", href=True):
-        m = DETAIL_RE.search(a["href"])
-        if not m:
-            continue
-        ml_id = m.group(1)
-        if ml_id in seen:
-            continue
-        seen.add(ml_id)
-        url = urllib.parse.urljoin(LIST_URL, a["href"])
+        href = a["href"]
+        if DETAIL_PREFIX in href:
+            links.append(href if href.startswith("http") else urljoin(BASE_URL, href))
+    # de-duplicate
+    seen, uniq = set(), []
+    for u in links:
+        if u not in seen:
+            uniq.append(u)
+            seen.add(u)
+    return uniq
 
-        # Try to pull structured cells if the link is inside a row
-        ort = fach = pruefer = datum = ""
-        tr = a.find_parent("tr")
-        if tr:
-            tds = tr.find_all("td")
-            if len(tds) >= 4:
-                ort = tds[0].get("title") or tds[0].get_text(" ", strip=True)
-                fach = tds[1].get("title") or tds[1].get_text(" ", strip=True)
-                pruefer = tds[2].get("title") or tds[2].get_text(" ", strip=True)
-                datum = tds[3].get("title") or tds[3].get_text(" ", strip=True)
 
-        title = a.get("title") or a.get_text(" ", strip=True) or f"Protokoll {ml_id}"
-        rows.append(
-            {
-                "ml_id": ml_id,
-                "ort_uni": (ort or "").strip(),
-                "fachrichtung": (fach or "").strip(),
-                "pruefer": (pruefer or "").strip(),
-                "eingefuegt": (datum or "").strip(),
-                "url": url,
-                "title": title,
-            }
-        )
-    rows.sort(key=lambda x: int(x["ml_id"]))
-    return rows
+def has_next_page(soup: BeautifulSoup) -> bool:
+    for a in soup.find_all("a", href=True):
+        if any(x in a.get_text(strip=True) for x in ["Weiter", "Nächste", "»", "->"]):
+            return True
+    return False
 
-# ----------------- Details -----------------
-def fetch_detail_text(sess: requests.Session, url: str) -> str:
-    r = sess.get(url, timeout=30, allow_redirects=True)
-    if r.status_code != 200:
-        return ""
-    enc = r.encoding or "utf-8"
-    try:
-        text = r.content.decode(enc, errors="ignore")
-    except Exception:
-        text = r.content.decode("latin-1", errors="ignore")
-    return BeautifulSoup(text, "html.parser").get_text(" ", strip=True)
 
-# ----------------- Crawl via page number loop -----------------
-def crawl_all_pages_by_number(
-    sess: requests.Session,
-    sel_vals: Dict[str, str],
-    rows_per_page: int,
-    max_pages: int,
-    pause_pages: float,
-    debug: bool = False,
-) -> List[Dict[str, str]]:
-    collected: Dict[str, Dict[str, str]] = {}
-    for page_nr in range(1, max_pages + 1):
-        params = make_params(sel_vals, rows_per_page, page_nr=page_nr)
-        url = f"{LIST_URL}?{urllib.parse.urlencode(params)}"
-        r = sess.get(url, timeout=30, allow_redirects=True)
-        soup = to_soup(r)
+def parse_detail_page(soup: BeautifulSoup, url: str) -> dict:
+    data = {"detail_url": url}
 
-        if debug:
-            st.caption(f"GET page {page_nr} → {r.url} (HTTP {r.status_code}, bytes={len(r.content)})")
+    # likely label/value pairs
+    labels = [
+        "Ort/Uni", "Fach", "Prüfer", "Atmosphäre", "Dauer", "Note",
+        "Datum", "Erstellt", "Prüfungsjahr", "Prüfungsort", "Prüfungsdatum"
+    ]
+    text_blocks = []
+    for el in soup.find_all(["p", "li", "div", "td"]):
+        t = el.get_text(" ", strip=True)
+        if ":" in t:
+            text_blocks.append(t)
 
-        # Extract links anywhere (table present or not)
-        found = extract_detail_links_anywhere(soup)
-        if debug:
-            st.caption(f"Page {page_nr}: found {len(found)} detail links")
+    for t in text_blocks:
+        parts = [x.strip() for x in re.split(r"\s{2,}", t)]
+        for seg in parts:
+            if ":" in seg:
+                lab, val = seg.split(":", 1)
+                lab, val = lab.strip(), val.strip()
+                if any(lab.startswith(L) for L in labels):
+                    data[lab] = val
 
-        # Stop if no links at this page number (assuming no holes)
-        if not found:
-            break
+    # headings for free text sections
+    def scrape_section_by_heading(headings):
+        # Search for bold or heading-like elements; then gather sibling text
+        candidates = soup.find_all(["h1", "h2", "h3", "strong", "b"])
+        for h in candidates:
+            ht = h.get_text(" ", strip=True)
+            for target in headings:
+                if target.casefold() in (ht or "").casefold():
+                    # collect next siblings within parent (simple heuristic)
+                    parent = h.parent if h.parent else soup
+                    texts = []
+                    for sib in parent.find_all(recursive=False):
+                        if sib is h:
+                            continue
+                        # stop when another heading-like appears
+                        if sib.find(["strong", "b"]) or sib.name in ["h1", "h2", "h3"]:
+                            break
+                        texts.append(sib.get_text(" ", strip=True))
+                    out = "\n".join([t for t in texts if t])
+                    if out:
+                        return out
+        return None
 
-        for row in found:
-            collected[row["ml_id"]] = row
+    fragen = scrape_section_by_heading(["Fragen", "Themen", "Themen/Fragen"])
+    tipps = scrape_section_by_heading(["Tipps", "Hinweise", "Empfehlungen"])
+    if fragen:
+        data["Fragen_Themen"] = fragen
+    if tipps:
+        data["Tipps"] = tipps
 
-        if pause_pages:
-            time.sleep(pause_pages)
+    title = soup.find("title")
+    if title:
+        data["title"] = title.get_text(strip=True)
 
-    out = list(collected.values())
-    out.sort(key=lambda x: int(x["ml_id"]))
-    return out
+    return data
 
-def enrich_with_details(
-    sess: requests.Session, rows: List[Dict[str, str]], pause_details: float
-) -> pd.DataFrame:
-    out = []
-    for r in rows:
-        txt = fetch_detail_text(sess, r["url"])
-        rec = dict(r)
-        rec["detail_text"] = txt
-        out.append(rec)
-        if pause_details:
-            time.sleep(pause_details)
-    df = pd.DataFrame(out)
-    cols = ["ml_id", "ort_uni", "fachrichtung", "pruefer", "eingefuegt", "url", "title", "detail_text"]
-    return df[cols]
 
-# ----------------- Streamlit UI -----------------
-st.set_page_config(page_title="Medi-Learn Protokolle — zählen & Details", page_icon="🩺", layout="wide")
-st.title("🩺 Medi-Learn Facharztprüfungsprotokolle — zählen & Details (robuste GET-Paginierung)")
+def scrape(uni_label: str, fach_label: str, max_pages: int, delay_sec: float) -> list[dict]:
+    search_soup = get_soup(BASE_URL)
+    time.sleep(delay_sec)
 
-with st.sidebar:
-    st.header("Filter (sichtbarer Text)")
-    uni_visible = st.text_input("Uni (FppUni)", value="Dresden")
-    fach_visible = st.text_input("Fach (FppFach)", value="Innere Medizin")
+    uni_val = find_select_value_by_label(search_soup, "FppUni", uni_label) or ""
+    fach_val = find_select_value_by_label(search_soup, "FppFach", fach_label) or ""
 
-    st.header("Ergebnisse")
-    rows_per_page = st.selectbox("Anzahl pro Seite", [5, 10, 15, 20, 25, 30, 35, 40], index=7)
-    max_pages = st.slider("Max. Seiten", 1, 120, 40)
-    pause_pages = st.slider("Pause zw. Seiten (s)", 0.0, 2.0, 0.2, 0.1)
+    if not uni_val:
+        raise RuntimeError(f"Could not resolve Uni option value for '{uni_label}'.")
+    if not fach_val:
+        raise RuntimeError(f"Could not resolve Fach option value for '{fach_label}'.")
 
-    st.header("Details")
-    load_details = st.checkbox("Detailseiten-Text mitladen", value=True)
-    pause_details = st.slider("Pause zw. Detail-Seiten (s)", 0.0, 1.0, 0.05, 0.05)
+    all_records = []
+    page = 1
+    with st.spinner("Scraping list pages…"):
+        while True:
+            list_url = build_results_url(uni_val, fach_val, page_nr=page, page_len=40)
+            st.write(f"**Fetching list page {page}:** {list_url}")
+            list_soup = get_soup(list_url)
+            time.sleep(delay_sec)
 
-    debug = st.checkbox("Debug: pro Seite Linkanzahl & URL zeigen", value=False)
-    go = st.button("🔎 Start")
+            detail_links = extract_detail_links_from_list(list_soup)
+            st.write(f"Found {len(detail_links)} detail links on page {page}.")
+            for durl in detail_links:
+                st.write(f"↳ Visiting detail: {durl}")
+                d_soup = get_soup(durl)
+                time.sleep(delay_sec)
+                rec = parse_detail_page(d_soup, durl)
+                all_records.append(rec)
 
-if go:
-    try:
-        sess = new_session()
-        # 1) Map visible strings to actual option values (e.g., Dresden→5, Innere Medizin→20)
-        sel_vals = read_option_values(sess, uni_visible.strip(), fach_visible.strip())
+            if page >= max_pages:
+                break
+            if not has_next_page(list_soup):
+                break
+            page += 1
 
-        # 2) Crawl by incrementing FppSeiteNr=1..N, extracting detail links anywhere on page
-        rows = crawl_all_pages_by_number(
-            sess,
-            sel_vals=sel_vals,
-            rows_per_page=int(rows_per_page),
-            max_pages=int(max_pages),
-            pause_pages=float(pause_pages),
-            debug=debug,
-        )
+    return all_records
 
-        st.subheader("Ergebnisse")
-        st.metric("Anzahl Protokolle", len(rows))
 
-        if not rows:
-            st.info("Keine Ergebnisse – prüfe die sichtbaren Texte oder erhöhe die Seitenzahl.")
-        else:
-            # 3) Fetch details if requested
-            if load_details:
-                with st.spinner("Detailseiten laden …"):
-                    df = enrich_with_details(sess, rows, float(pause_details))
-            else:
-                df = pd.DataFrame(rows)[["ml_id", "ort_uni", "fachrichtung", "pruefer", "eingefuegt", "url", "title"]]
-
-            st.dataframe(df, use_container_width=True)
-            csv = df.to_csv(index=False).encode("utf-8")
-            st.download_button(
-                "⬇️ CSV herunterladen",
-                data=csv,
-                file_name=f"medi_learn_{uni_visible}_{fach_visible}.csv",
-                mime="text/csv",
-            )
-
-    except Exception as exc:
-        st.error(f"Fehler: {exc}")
+# ---- UI ----
+st.title(
