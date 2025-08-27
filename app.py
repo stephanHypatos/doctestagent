@@ -35,18 +35,16 @@ def absolute_url(base: str, href: str | None) -> str | None:
 def get_soup(session: requests.Session, url: str) -> BeautifulSoup:
     r = session.get(url, headers=HEADERS, timeout=30)
     r.raise_for_status()
-    return BeautifulSoup(r.text, "lxml")
+    # Use built-in parser to avoid lxml dependency
+    return BeautifulSoup(r.text, "html.parser")
 
 def get_forms(soup: BeautifulSoup):
     return soup.find_all("form")
 
 def form_has_filters(form: BeautifulSoup) -> bool:
-    """Heuristic: does this form look like the one with Uni/Fach filters?"""
     txt = form.get_text(" ", strip=True).lower()
-    # Look for typical German labels/keywords around those filters
     needles = ["uni", "universität", "standort", "ort", "fach", "fachgebiet", "innere", "medizin"]
     score = sum(1 for n in needles if n in txt)
-    # Also check selects count
     has_selects = bool(form.find_all("select"))
     return has_selects and score >= 2
 
@@ -60,9 +58,6 @@ def collect_hidden_inputs(form: BeautifulSoup) -> dict:
     return data
 
 def option_map_by_text(select: BeautifulSoup) -> dict:
-    """
-    Return {normalized_visible_text: (value, visible_text)} for all <option>.
-    """
     out = {}
     for opt in select.find_all("option"):
         vis = opt.get_text(strip=True)
@@ -73,13 +68,9 @@ def option_map_by_text(select: BeautifulSoup) -> dict:
     return out
 
 def find_selects(form: BeautifulSoup):
-    selects = form.find_all("select")
-    return selects
+    return form.find_all("select")
 
 def guess_select_role(select: BeautifulSoup) -> str | None:
-    """
-    Try to guess if a select is for 'uni' or 'fach' based on label, name, id, or option texts.
-    """
     name = (select.get("name") or "").lower()
     sid = (select.get("id") or "").lower()
     around = select.find_parent().get_text(" ", strip=True).lower()
@@ -87,19 +78,16 @@ def guess_select_role(select: BeautifulSoup) -> str | None:
     uni_tokens = ["uni", "universität", "standort", "ort", "tu dresden", "dresden"]
     fach_tokens = ["fach", "fachgebiet", "innere", "medizin", "chirurgie", "neurologie"]
 
-    # name/id heuristic
     if any(t in name or t in sid for t in ["uni", "standort", "ort"]):
         return "uni"
     if any(t in name or t in sid for t in ["fach", "fachgebiet", "gebiet"]):
         return "fach"
 
-    # nearby text heuristic
     if any(t in around for t in uni_tokens):
         return "uni"
     if any(t in around for t in fach_tokens):
         return "fach"
 
-    # option-content heuristic: if many options look like cities/unis vs. specialties
     opts = [norm(o.get_text(strip=True)) for o in select.find_all("option")]
     city_hits = sum(1 for o in opts if any(c in o for c in ["berlin", "münchen", "hamburg", "dresden", "köln", "hannover", "frankfurt"]))
     fach_hits = sum(1 for o in opts if any(f in o for f in ["innere", "chirurgie", "neurologie", "anästhesie", "derma", "gyn"]))
@@ -110,27 +98,17 @@ def guess_select_role(select: BeautifulSoup) -> str | None:
     return None
 
 def pick_option_value(select: BeautifulSoup, wanted_text: str) -> tuple[str | None, str | None]:
-    """
-    Match user 'wanted_text' against visible option text (case/space-insensitive).
-    Returns (value, visible_text) or (None, None).
-    """
     omap = option_map_by_text(select)
     key = norm(wanted_text)
-    # direct
     if key in omap:
         return omap[key]
-    # fuzzy: startswith or contains
     for k, (v, vis) in omap.items():
         if k.startswith(key) or key in k or k in key:
             return v, vis
     return None, None
 
 def extract_result_rows(soup: BeautifulSoup) -> list[dict]:
-    """
-    Extract links to detailed.php?ID=… and some small info from the result page.
-    """
     rows = []
-    # Strategy: any anchor that contains detailed.php?ID=…
     for a in soup.find_all("a", href=True):
         m = DETAIL_RE.search(a["href"])
         if not m:
@@ -139,7 +117,6 @@ def extract_result_rows(soup: BeautifulSoup) -> list[dict]:
         url = absolute_url(START_URL, a["href"])
         title = a.get_text(" ", strip=True) or f"Protokoll {ml_id}"
         rows.append({"ml_id": ml_id, "title": title, "url": url})
-    # De-dup by ml_id
     seen = set()
     uniq = []
     for r in rows:
@@ -150,10 +127,6 @@ def extract_result_rows(soup: BeautifulSoup) -> list[dict]:
     return uniq
 
 def find_next_page_url(soup: BeautifulSoup) -> str | None:
-    """
-    Try to find 'next' pagination link (weiter, nächste, >, etc.).
-    """
-    # Look for anchors with typical next labels
     candidates = []
     for a in soup.find_all("a", href=True):
         txt = a.get_text(" ", strip=True).lower()
@@ -161,7 +134,6 @@ def find_next_page_url(soup: BeautifulSoup) -> str | None:
             candidates.append(a["href"])
     if not candidates:
         return None
-    # Prefer the first that stays within the same tool path
     for href in candidates:
         full = absolute_url(START_URL, href)
         if "/pruefungsprotokolle/facharztpruefung" in full:
@@ -169,10 +141,6 @@ def find_next_page_url(soup: BeautifulSoup) -> str | None:
     return absolute_url(START_URL, candidates[0])
 
 def submit_filter(session: requests.Session, start_soup: BeautifulSoup, uni_text: str, fach_text: str) -> tuple[list[dict], BeautifulSoup]:
-    """
-    Locate the filter form, select the desired Uni & Fach by visible text,
-    POST it, parse the first result page, and return (rows, soup).
-    """
     forms = get_forms(start_soup)
     target_form = None
     for f in forms:
@@ -180,7 +148,6 @@ def submit_filter(session: requests.Session, start_soup: BeautifulSoup, uni_text
             target_form = f
             break
     if not target_form:
-        # fallback: first form
         if forms:
             target_form = forms[0]
         else:
@@ -191,7 +158,6 @@ def submit_filter(session: requests.Session, start_soup: BeautifulSoup, uni_text
 
     payload = collect_hidden_inputs(target_form)
 
-    # Identify selects and pick values
     selects = find_selects(target_form)
     uni_name = fach_name = None
     uni_val = fach_val = None
@@ -208,7 +174,6 @@ def submit_filter(session: requests.Session, start_soup: BeautifulSoup, uni_text
                 fach_val = v
                 fach_name = sel.get("name")
 
-    # If roles weren’t guessed, try best-effort by presence of the desired text in options
     if not uni_val:
         for sel in selects:
             v, vis = pick_option_value(sel, uni_text)
@@ -234,22 +199,17 @@ def submit_filter(session: requests.Session, start_soup: BeautifulSoup, uni_text
     payload[uni_name] = uni_val
     payload[fach_name] = fach_val
 
-    # Try to detect submit button name/value (some forms require it)
     submit = target_form.find("input", {"type": "submit"})
     if submit and submit.get("name"):
         payload[submit["name"]] = submit.get("value", "Suchen")
 
-    # Send POST
     r = session.post(action_url, data=payload, headers=HEADERS, timeout=30)
     r.raise_for_status()
-    soup = BeautifulSoup(r.text, "lxml")
+    soup = BeautifulSoup(r.text, "html.parser")
     rows = extract_result_rows(soup)
     return rows, soup
 
 def crawl_all_pages(session: requests.Session, first_soup: BeautifulSoup, pause_s: float = 0.5) -> list[dict]:
-    """
-    Starting from the first results page soup, follow pagination and aggregate rows.
-    """
     all_rows = extract_result_rows(first_soup)
     seen_ids = {r["ml_id"] for r in all_rows}
 
@@ -260,26 +220,21 @@ def crawl_all_pages(session: requests.Session, first_soup: BeautifulSoup, pause_
         time.sleep(pause_s)
         r = session.get(next_url, headers=HEADERS, timeout=30)
         r.raise_for_status()
-        soup = BeautifulSoup(r.text, "lxml")
+        soup = BeautifulSoup(r.text, "html.parser")
         rows = extract_result_rows(soup)
         for r_ in rows:
             if r_["ml_id"] not in seen_ids:
                 seen_ids.add(r_["ml_id"])
                 all_rows.append(r_)
         next_url = find_next_page_url(soup)
-    # sort by id numeric
     all_rows.sort(key=lambda x: int(x["ml_id"]))
     return all_rows
 
 def fetch_detail_fields(session: requests.Session, url: str) -> dict:
-    """
-    Optional enrichment: fetch each detail page and try to extract 'Uni' and 'Fach'
-    and maybe Atmosphere/Prüfer fields for quick display.
-    """
     try:
         r = session.get(url, headers=HEADERS, timeout=30)
         r.raise_for_status()
-        soup = BeautifulSoup(r.text, "lxml")
+        soup = BeautifulSoup(r.text, "html.parser")
         text = soup.get_text(" ", strip=True)
         low = text.lower()
 
@@ -287,7 +242,6 @@ def fetch_detail_fields(session: requests.Session, url: str) -> dict:
             for lab in label_variants:
                 m = re.search(lab, low)
                 if m:
-                    # take the next ~150 chars as snippet
                     start = m.end()
                     snippet = text[start:start+150]
                     snippet = re.split(r"[\n\r|•\-]{2,}|  ", snippet)[0]
@@ -300,21 +254,10 @@ def fetch_detail_fields(session: requests.Session, url: str) -> dict:
         pruefer = grab([r"pr[üu]fer", r"vorsitz", r"kommission"])
 
         title = soup.title.get_text(strip=True) if soup.title else url
-        return {
-            "title_detail": title,
-            "uni_guess": uni_guess,
-            "fach_guess": fach_guess,
-            "atmosphaere": atm,
-            "pruefer": pruefer
-        }
+        return {"title_detail": title, "uni_guess": uni_guess, "fach_guess": fach_guess,
+                "atmosphaere": atm, "pruefer": pruefer}
     except Exception:
-        return {
-            "title_detail": "",
-            "uni_guess": "",
-            "fach_guess": "",
-            "atmosphaere": "",
-            "pruefer": ""
-        }
+        return {"title_detail": "", "uni_guess": "", "fach_guess": "", "atmosphaere": "", "pruefer": ""}
 
 # ======================================
 # Streamlit UI
@@ -325,18 +268,14 @@ st.caption("Posts the real Medi-Learn filter form (no search engines). Handles p
 
 with st.sidebar:
     st.header("Filter")
-    uni = st.text_input("Universität (sichtbarer Text)", value="Dresden", help="Geben Sie den sichtbaren Uni-Text ein, z. B. „Dresden“, „TU Dresden“, „Uniklinikum Dresden“.")
+    uni = st.text_input("Universität (sichtbarer Text)", value="Dresden",
+                        help="Geben Sie den sichtbaren Uni-Text ein, z. B. „Dresden“, „TU Dresden“, „Uniklinikum Dresden“.")
     fach = st.text_input("Fach (sichtbarer Text)", value="Innere Medizin", help="Z. B. „Innere Medizin“.")
     enrich = st.checkbox("Optional: Details aus jeder Protokoll-Seite lesen (langsamer)", value=False)
     pause = st.slider("Pausenzeit bei Pagination (Sek.)", 0.0, 2.0, 0.5, 0.1)
     go = st.button("📤 Formular absenden & Zählen")
 
-st.markdown(
-    """
-**Hinweis:** Dieses Tool versucht automatisch die richtigen Formularfelder (Uni/Fach) zu erkennen, wählt die Option \
-entsprechend dem **sichtbaren Text** und sendet dann die Anfrage ab.
-"""
-)
+st.markdown("**Hinweis:** Das Tool erkennt die richtigen Formularfelder (Uni/Fach) automatisch, wählt anhand des sichtbaren Textes und sendet die Anfrage ab.")
 
 if go:
     try:
@@ -351,13 +290,10 @@ if go:
         with st.spinner("Folge Pagination (falls vorhanden)…"):
             all_rows = crawl_all_pages(sess, first_soup, pause_s=pause)
 
-        # If the first submit already returned results that might not be included in pagination-driven crawl,
-        # merge them as well:
         ids_seen = {r["ml_id"] for r in all_rows}
         for r0 in rows:
             if r0["ml_id"] not in ids_seen:
-                all_rows.append(r0)
-                ids_seen.add(r0["ml_id"])
+                all_rows.append(r0); ids_seen.add(r0["ml_id"])
         all_rows.sort(key=lambda x: int(x["ml_id"]))
 
         st.subheader("Ergebnis")
@@ -378,7 +314,6 @@ if go:
                     extra_df = pd.DataFrame(extra)
                     df = pd.concat([df.reset_index(drop=True), extra_df.reset_index(drop=True)], axis=1)
 
-            # order columns nicely
             base_cols = ["ml_id", "title", "url"]
             extra_cols = [c for c in df.columns if c not in base_cols]
             df = df[base_cols + extra_cols]
@@ -395,12 +330,7 @@ if go:
 
         st.divider()
         st.markdown(
-            """
-            **Tipps:**
-            - Nutzen Sie exakt den **sichtbaren Text** der Optionen (z. B. „Innere Medizin“, nicht „Innere“ – je nach Seite).
-            - Probieren Sie Varianten wie „TU Dresden“ vs. „Dresden“.
-            - Wenn die Seite einen CSRF-Token oder zwingende „submit“-Feldnamen verlangt, werden diese automatisch aus dem Formular übernommen.
-            """
+            "**Tipps:** Versuchen Sie Varianten des sichtbaren Texts (z. B. „TU Dresden“), falls die Seite andere Bezeichnungen nutzt."
         )
 
     except Exception as e:
