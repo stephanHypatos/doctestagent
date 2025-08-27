@@ -207,4 +207,66 @@ def scrape(uni_label: str, fach_label: str, max_pages: int, delay_sec: float) ->
 
 
 # ---- UI ----
-st.title(
+st.title("Medi-Learn Facharzt-Prüfungsprotokolle Scraper")
+st.caption(
+    "Filter → list → open each **Details** page → extract fields → preview → download CSV/JSON.\n"
+    "Defaults are **Dresden** (Uni) and **Innere Medizin** (Fach)."
+)
+
+with st.sidebar:
+    st.header("Filters")
+    opts = discover_filter_values()
+
+    # Dropdowns show the visible labels; we will resolve values dynamically
+    uni_labels = [t for t, _ in opts.get("uni", [])]
+    fach_labels = [t for t, _ in opts.get("fach", [])]
+
+    # Reasonable defaults
+    default_uni = next((i for i, t in enumerate(uni_labels) if "dresden" in t.lower()), 0) if uni_labels else 0
+    default_fach = next((i for i, t in enumerate(fach_labels) if "innere" in t.lower()), 0) if fach_labels else 0
+
+    uni_choice = st.selectbox("Universität (Anzeige-Text)", uni_labels or ["—"], index=default_uni)
+    fach_choice = st.selectbox("Fach (Anzeige-Text)", fach_labels or ["—"], index=default_fach)
+
+    max_pages = st.number_input("Max. Seiten durchsuchen", min_value=1, max_value=50, value=10, step=1)
+    delay_sec = st.slider("Pausenzeit pro Anfrage (Sekunden)", min_value=0.0, max_value=3.0, value=DEFAULT_SLEEP, step=0.1)
+
+    run = st.button("Scrape starten", type="primary")
+
+if run:
+    try:
+        records = scrape(uni_choice, fach_choice, max_pages=int(max_pages), delay_sec=float(delay_sec))
+        st.success(f"Fertig. {len(records)} Protokolle extrahiert.")
+
+        if records:
+            df = pd.DataFrame(records)
+            st.dataframe(df, use_container_width=True)
+
+            # Prepare downloads
+            json_bytes = json.dumps(records, ensure_ascii=False, indent=2).encode("utf-8")
+            st.download_button("Download JSON", data=json_bytes, file_name="medi_learn_protokolle.json", mime="application/json")
+
+            # CSV
+            # compute union of keys for consistent header
+            keys = sorted({k for r in records for k in r.keys()})
+            # write CSV to string
+            import io
+            sio = io.StringIO()
+            writer = csv.DictWriter(sio, fieldnames=keys)
+            writer.writeheader()
+            for r in records:
+                writer.writerow(r)
+            st.download_button("Download CSV", data=sio.getvalue().encode("utf-8"), file_name="medi_learn_protokolle.csv", mime="text/csv")
+        else:
+            st.info("Keine Datensätze gefunden. Bitte Filter prüfen oder die Seitenanzahl erhöhen.")
+
+    except Exception as e:
+        st.error(f"Fehler: {e}")
+
+with st.expander("Hinweise & Ethik"):
+    st.markdown(
+        "- Die App nutzt eine **dynamische Auflösung** der Auswahlfelder (FppUni, FppFach) von der öffentlichen Suchseite.\n"
+        "- Sie sendet Anfragen mit einem höflichen **User-Agent** und **Pausen** zwischen Requests.\n"
+        "- Bitte beachte die **Nutzungsbedingungen** der Zielseite und vermeide übermäßige Last.\n"
+        "- Extraktionslogik ist robust aber generisch; Detailseiten können variieren."
+    )
